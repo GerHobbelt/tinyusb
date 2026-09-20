@@ -21,9 +21,9 @@ Run the software + hardware gate for the current branch. The user invoking this 
   `build.full` is true, use `stm32f407disco` + `raspberry_pi_pico` as the broad representative
   set.
 - A non-default build target selected by the changed path must run through its existing
-  command (for example, `tinyusb_metrics` for `tools/metrics.py`). A default board sweep is
-  not evidence for a target it does not execute; report the target unverified if the current
-  workflow cannot express it.
+  command (for example, `examples-membrowse-upload` for `tools/membrowse_report.py`). A
+  default board sweep is not evidence for a target it does not execute; report the target
+  unverified if the current workflow cannot express it.
 - `hilBoards`: derive only from the top-level HIL selection, never from `buildBoards`. When
   top-level `full` is false, sample one board per family from the keys of top-level `boards`;
   when it is true, use the broad representative set above. Run HIL only if the rig is reachable
@@ -43,6 +43,6 @@ If the unique union of `buildBoards` and `hilBoards` is non-empty, invoke the Wo
 ## 4. Summarize
 
 - Per-stage table: unit / build:<board> / size / pvs, then HIL per board — pass/fail with the first error for each failure.
-- If the hardware result has non-empty `locked` (a CI job held those boards): ask the user to choose **Force now** (re-invoke `hil-validate` with `force: true` for those boards; user accepts the risk of colliding with a mid-test CI job), **Keep waiting** (re-invoke `hil-validate` for them after a few minutes; ask again if still locked), or **Accept** the partial verdict. Never force without the user's answer.
+- If the hardware result has non-empty `locked` (a CI job held those boards): when the task scope names forcing those boards, re-invoke `hil-validate` with `force: true` for them (it risks colliding with a mid-test CI job); otherwise re-invoke it after a few minutes, and if they stay locked return the holders and the scope gap to the caller. Accepting the partial verdict is the caller's decision; in an interactive session, ask.
 - Wedged boards: point at `.claude/skills/usb-kernel-recover/SKILL.md`.
 - End with a clear ship / no-ship verdict and what to fix first.
