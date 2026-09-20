@@ -87,12 +87,15 @@ extern "C" {
 #define CFG_TUH_MSC                 0
 #define CFG_TUH_VENDOR              0
 #define CFG_TUH_AUDIO               1
+#ifndef CFG_TUH_AUDIO_PROTOCOLS
+  #define CFG_TUH_AUDIO_PROTOCOLS (TUH_AUDIO_PROTOCOL_UAC1 | TUH_AUDIO_PROTOCOL_UAC2)
+#endif
 
 // max device support (excluding hub device): 1 hub typically has 4 ports
 #define CFG_TUH_DEVICE_MAX (3 * CFG_TUH_HUB + 1)
 
 //------------- Audio Host Config -------------//
-#define CFG_TUH_AUDIO_MAX           2
+#define CFG_TUH_AUDIO_MAX           1
 #define CFG_TUH_AUDIO_EPIN_BUFSIZE  256 // max capture transfer the application submits
 #define CFG_TUH_AUDIO_EPOUT_BUFSIZE 256 // max playback transfer the application submits
 

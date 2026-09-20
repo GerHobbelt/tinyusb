@@ -8,7 +8,7 @@ Reference these instructions first; fall back to search/bash only when reality d
 
 Bias toward caution over speed. For trivial tasks, use judgment.
 
-- **Think first** — state assumptions; ask if unclear; present alternatives instead of picking silently.
+- **Think first** — state assumptions; ask if unclear; when a choice matters, name it and recommend one rather than picking silently or surveying every option.
 - **Simplicity** — no features, abstractions, flexibility, or error handling beyond what was asked. If 200 lines could be 50, rewrite.
 - **Surgical changes** — touch only what the task requires; match existing style; don't refactor working code; mention unrelated dead code rather than deleting it. Remove only orphans *your* changes created.
 - **Goal-driven** — turn tasks into verifiable goals ("write failing test, make it pass"). For multi-step work, state a brief `step → verify` plan.
@@ -74,7 +74,7 @@ Terminal 2 — connect (`<port>`: 2331 JLink, 3333 OpenOCD):
 arm-none-eabi-gdb build/your_app.elf
 (gdb) target remote :<port>    # then: monitor reset halt → load → continue
 ```
-**RTT:** build `LOG=2 LOGGER=rtt`, run JLinkGDBServer with `-RTTTelnetPort 19021`, then `JLinkRTTClient` (`timeout 20s JLinkRTTClient > rtt.log` for non-interactive capture).
+**RTT:** build `LOG=2 LOGGER=rtt`; capture/console via the `rtt` skill (`.claude/skills/rtt/SKILL.md`).
 
 ## Testing
 
