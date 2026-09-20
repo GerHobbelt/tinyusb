@@ -140,7 +140,7 @@ class BottomLayer(unittest.TestCase):
         # module runs ctypes.CDLL(find_library('mtp')) at import and raises where there
         # is no libmtp, taking ci_select down with it.
         local = {'helper', 'hil_util', 'ci_select', 'hil_flash',
-                 'hil_health', 'hil_lock', 'hil_pool_check', 'build', 'build_utils'}
+                 'hil_health', 'hil_lock', 'hil_pool_check', 'build', 'build_utils', 'get_deps', 'family_json'}
         allowed = set(sys.stdlib_module_names) | local
         # hil_pool_check included: test_hil_util_is_a_single_module_instance imports it
         # on the bare runner, and its `import serial` is function-local for exactly
@@ -151,7 +151,8 @@ class BottomLayer(unittest.TestCase):
         # the ast.Import walk below, which is why it must be listed explicitly
         for mod in ('helper/hil_util', 'hil_flash', '../../tools/ci_select',
                     'helper/hil_health', 'helper/hil_lock', 'helper/hil_pool_check',
-                    '../../tools/build', '../../tools/build_utils', '../../tools/rtt'):
+                    '../../tools/build', '../../tools/build_utils', '../../tools/rtt',
+                    '../../tools/get_deps', '../../tools/family_json'):
             tree = ast.parse((hil_dir / f'{mod}.py').read_text())
             # module level only: a deferred import inside a function cannot break
             # importability (hil_pool_check keeps `import serial` function-local
@@ -442,6 +443,49 @@ class BoundedReadForGuardlessCallers(unittest.TestCase):
         Path(good).write_text('3\n')
         self.assertEqual(self.hil_util.read_sysfs(good), '3')
         self.assertIsNone(self.hil_util.read_sysfs(os.path.join(self.td.name, 'nope')))
+
+
+class PoolCheckEspIdfBuild(unittest.TestCase):
+    def setUp(self):
+        from helper import hil_pool_check
+        self.pool_check = hil_pool_check
+        self.board = {'name': 'esp32s3', 'flasher': {'name': 'esptool'}}
+        self.example = 'device/cdc_msc_freertos'
+        self.old_idf_path = os.environ.get('IDF_PATH')
+        self.addCleanup(self._restore_idf_path)
+        self.old_which = self.pool_check.shutil.which
+        self.addCleanup(setattr, self.pool_check.shutil, 'which', self.old_which)
+        self.old_run_cmd = self.pool_check.hil_util.run_cmd
+        self.addCleanup(setattr, self.pool_check.hil_util, 'run_cmd', self.old_run_cmd)
+        self.pool_check.shutil.which = lambda _: None
+
+    def _restore_idf_path(self):
+        if self.old_idf_path is None:
+            os.environ.pop('IDF_PATH', None)
+        else:
+            os.environ['IDF_PATH'] = self.old_idf_path
+
+    def test_missing_export_script_reports_missing_idf_environment(self):
+        os.environ['IDF_PATH'] = '/definitely/missing/esp-idf'
+        self.assertEqual(self.pool_check.build_example(self.board, 'esp32s3', self.example), 127)
+
+    def test_idf_command_is_shell_quoted_without_argument_forwarding(self):
+        with TemporaryDirectory(prefix='idf $path ') as td:
+            Path(td, 'export.sh').touch()
+            os.environ['IDF_PATH'] = td
+            calls = []
+
+            def fake_run_cmd(cmd, **kwargs):
+                calls.append((cmd, kwargs))
+                return type('Result', (), {'returncode': 0})()
+
+            self.pool_check.hil_util.run_cmd = fake_run_cmd
+            self.assertEqual(self.pool_check.build_example(self.board, 'esp32s3', self.example), 0)
+            cmd, kwargs = calls[0]
+            self.assertEqual(cmd[:4], ['env', f'IDF_PATH={td}', 'bash', '-c'])
+            self.assertTrue(cmd[4].startswith('. "$IDF_PATH/export.sh" >/dev/null && idf.py '))
+            self.assertNotIn('$@', cmd[4])
+            self.assertEqual(kwargs['timeout'], 600)
 
 
 if __name__ == '__main__':

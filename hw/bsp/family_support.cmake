@@ -778,6 +778,24 @@ function(family_flash_pyocd TARGET)
 endfunction()
 
 
+# Add flash with https://probe.rs
+function(family_flash_probe_rs TARGET)
+  if (NOT DEFINED PROBE_RS)
+    set(PROBE_RS probe-rs)
+  endif ()
+
+  separate_arguments(OPTION_LIST UNIX_COMMAND ${PROBE_RS_OPTION})
+
+  add_custom_target(${TARGET}-probe-rs
+    DEPENDS ${TARGET}
+    COMMAND ${PROBE_RS} download --chip ${PROBE_RS_CHIP} ${OPTION_LIST} --verify --reset $<TARGET_FILE:${TARGET}>
+    VERBATIM
+    )
+
+  #set_property(TARGET ${TARGET}-probe-rs PROPERTY FOLDER ${TARGET}-group)
+endfunction()
+
+
 # Flash with UF2
 function(family_flash_uf2 TARGET FAMILY_ID)
   add_custom_target(${TARGET}-uf2
@@ -940,6 +958,25 @@ endif()
 if (MAX3421_HOST STREQUAL "1")
   set(FAMILY_MCUS ${FAMILY_MCUS} MAX3421)
 endif ()
+
+# What this configure selected, for tools/family_json.py to join with the compile
+# database into the board's hw/bsp/family.json row. Written on every configure;
+# tools/build.py decides whether the configure was the board's default one.
+set(_FJ_MCUS "")
+foreach(_FJ_M ${FAMILY_MCUS})
+  string(REPLACE "\\" "\\\\" _FJ_M "${_FJ_M}")
+  string(REPLACE "\"" "\\\"" _FJ_M "${_FJ_M}")
+  list(APPEND _FJ_MCUS "\"${_FJ_M}\"")
+endforeach()
+list(JOIN _FJ_MCUS ", " _FJ_MCUS)
+set(_FJ_OPTIONS "")
+if (DEFINED MAX3421_HOST)
+  string(REPLACE "\\" "\\\\" _FJ_V "${MAX3421_HOST}")
+  string(REPLACE "\"" "\\\"" _FJ_V "${_FJ_V}")
+  set(_FJ_OPTIONS "\"MAX3421_HOST\": \"${_FJ_V}\"")
+endif ()
+file(WRITE ${CMAKE_BINARY_DIR}/family.json.part
+  "{\"board\": \"${BOARD}\", \"family\": \"${FAMILY}\", \"family_mcus\": [${_FJ_MCUS}], \"options\": {${_FJ_OPTIONS}}}\n")
 
 # save it in case of re-inclusion
 set(FAMILY_MCUS ${FAMILY_MCUS} CACHE INTERNAL "")

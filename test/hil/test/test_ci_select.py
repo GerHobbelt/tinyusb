@@ -993,6 +993,7 @@ class TestTheHarnessTestsAreNotTheHarness(unittest.TestCase):
             'test/hil/test/stubs/pymtp.py',
             'test/hil/test/test_ci_metrics.py',
             'test/hil/test/test_ci_select.py',
+            'test/hil/test/test_family_json.py',
             'test/hil/test/test_hil_bounded.py',
             'test/hil/test/test_hil_health.py',
             'test/hil/test/test_hil_report.py',
@@ -1614,7 +1615,8 @@ class TestBuildClassifier(unittest.TestCase):
     def test_full_paths(self):                                     # rules 15-17
         for p in ('src/common/tusb_fifo.c', 'src/osal/osal.h', 'src/tusb.c',
                   'src/tusb_option.h',
-                  'tools/build.py', 'tools/cmake/cpu/cortex-m4.cmake',
+                  'tools/build.py', 'tools/family_json.py',
+                  'tools/cmake/cpu/cortex-m4.cmake',
                   'examples/CMakeLists.txt', 'examples/device/CMakeLists.txt',
                   'examples/build_system/cmake/cpu.cmake', '.github/workflows/build.yml',
                   '.circleci/config.yml', 'src/CMakeLists.txt', 'src/tinyusb.mk',
@@ -1629,7 +1631,7 @@ class TestBuildClassifier(unittest.TestCase):
                   '.clang-format', '.idea/misc.xml', 'version.yml', 'library.json',
                   'examples/CMakePresets.json', 'test/fuzz/fuzz.cc',
                   'test/unit-test/project.yml', '.github/workflows/pr_comment.yml',
-                  'tools/gen_doc.py', '.agents', '.codex/agents/builder.toml'):
+                  '.claude/skills/build-doc/scripts/gen_doc.py', '.agents', '.codex/agents/builder.toml'):
             s = self.b([p])
             self.assertFalse(s['full'], p)
             self.assertEqual(s['families'], [], p)

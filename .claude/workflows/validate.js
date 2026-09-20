@@ -1,15 +1,15 @@
 export const meta = {
   name: 'validate',
-  description: 'Pre-PR software validation loop: unit tests + per-board build sweeps + code-size compare + PVS + diff reviews (claude + codex) in parallel; a red verdict dispatches a fix agent for the confirmed findings, then the affected stages re-run — up to maxCycles (default 5) validation passes; a fix that edits a workflow file stops with restartRequired so the caller re-invokes it',
+  description: 'Pre-PR software validation loop: unit tests + per-board build sweeps + code-size compare + PVS + the diff review in parallel; a red verdict dispatches a fix agent for the confirmed findings, then the affected stages re-run — up to maxCycles (default 5) validation passes; a fix that edits a workflow file stops with restartRequired so the caller re-invokes it',
   whenToUse: 'Before opening or updating a PR, after any non-trivial change',
   phases: [
-    { title: 'Validate', detail: 'unit + builds + size + pvs + reviews in parallel' },
+    { title: 'Validate', detail: 'unit + builds + size + pvs + review in parallel' },
     { title: 'Fix', detail: 'one fix agent per red cycle; commits, then affected stages re-run' },
   ],
 }
 
 // args: { boards: string[], examples?: string, base?: string,
-//         skip?: ('unit'|'size'|'pvs'|'review'|'codex')[], maxCycles?: number }
+//         skip?: ('unit'|'size'|'pvs'|'review')[], maxCycles?: number }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !Array.isArray(args.boards) || args.boards.length === 0) {
   throw new Error('args must be { boards: string[], examples?, base?, skip?, maxCycles? }')
@@ -118,15 +118,12 @@ const reviewBlocking = f =>
 
 // ---------------------------------------------------------------------------
 // Stage builders, parameterized so later cycles can re-run a subset. Stage
-// names: 'unit', 'build:<board>', 'size', 'pvs', and the dual-provider
-// 'reviews' scheduler, which emits the public 'review' and 'codex' rows.
+// names: 'unit', 'build:<board>', 'size', 'pvs', 'review'.
 // ---------------------------------------------------------------------------
-const reviewStageNames = []
-if (!skip.includes('review')) reviewStageNames.push('review')
-if (!skip.includes('codex')) reviewStageNames.push('codex')
-const reviewProvider = reviewStageNames.length === 2 ? 'both'
-  : reviewStageNames[0] === 'review' ? 'claude'
-    : reviewStageNames[0] === 'codex' ? 'codex' : null
+// Reviewing nothing is only legal as an unmistakable request, because this is
+// the pre-PR gate: anything less would let it report green over an unreviewed diff.
+const review = !skip.includes('review')
+if (!review) log('no diff review will run — review is skipped')
 const reviewPrompt =
   `Code-review this branch's diff vs ${base} (git diff ${base}...HEAD), coverage-first: walk every hunk, no spot checks. ` +
   'Find pass — candidate defects across all dimensions: correctness/logic, ISR & concurrency safety, ' +
@@ -143,23 +140,20 @@ if (!skip.includes('unit')) stageNames.push('unit')
 for (const b of args.boards) stageNames.push(`build:${b}`)
 if (!skip.includes('size')) stageNames.push('size')
 if (!skip.includes('pvs')) stageNames.push('pvs')
-if (reviewProvider) stageNames.push('reviews')
-const scheduleName = name => name === 'review' || name === 'codex' ? 'reviews' : name
-const displayNames = names => names.flatMap(name => name === 'reviews' ? reviewStageNames : [name])
+if (review) stageNames.push('review')
 
-function runReviewProvider(provider, label) {
-  if (provider === 'codex') return agent(
-    JSON.stringify({ prompt: reviewPrompt, schema: REVIEW }),
-    { label: `${label}:codex`, phase: 'Validate', agentType: 'codex-code-verifier', schema: REVIEW },
-  )
-  return agent(reviewPrompt, {
-    label: `${label}:claude`, phase: 'Validate', agentType: 'code-verifier', schema: REVIEW,
-  })
-}
+// The analyser needs one compile database, and tools/build.py writes one per
+// example under <build dir>/<example>/ for an Espressif board (idf.py backend)
+// instead of one at the build dir root — so an Espressif board is no candidate.
+// Candidates are the sweep's own boards, so PVS still sees the changed port,
+// then the board the repo designates for static analysis: stm32f407disco is
+// the fastest of the two and dwc2 like the Espressif parts.
+const pvsBoards = [...args.boards, 'stm32f407disco'].join(' ')
+if (!skip.includes('pvs')) log(`pvs compile DB: first non-Espressif of ${pvsBoards}`)
 
 function stageThunk(name, cycle) {
   const label = (cycle > 1 ? `c${cycle}:` : '') + name
-  // findings: [] so a dead review/codex stage flows through fixerEvidence()
+  // findings: [] so a dead review stage flows through fixerEvidence()
   // instead of throwing on f.findings inside the fix dispatch's catch
   const died = { stage: name, pass: false, findings: [], detail: 'stage agent died' }
 
@@ -172,7 +166,7 @@ function stageThunk(name, cycle) {
   if (name.startsWith('build:')) {
     const b = name.slice('build:'.length)
     return () => agent(
-      `Build TinyUSB examples for board ${b}` + (args.examples ? ` (only: ${args.examples})` : ' (full example set)') + '.',
+      `Build TinyUSB examples for board ${b}` + (args.examples ? ` (only: ${args.examples})` : ' (full example set)') + ' in the shared HIL build dir.',
       { label, phase: 'Validate', agentType: 'builder', schema: BUILD },
     ).then(r => r ? {
       stage: name, pass: r.pass,
@@ -188,36 +182,27 @@ function stageThunk(name, cycle) {
   ).then(r => r ? { stage: name, ...r } : died).catch(() => died)
 
   if (name === 'pvs') return () => agent(
-    `Run PVS-Studio static analysis for board ${args.boards[0]}, gating on files changed vs ${base}. ` +
-    'Parallel build agents are running — use your dedicated build dir, never cmake-build-<board>.',
-    { label, phase: 'Validate', agentType: 'static-analyzer', effort: 'low', schema: PVS },
+    'Compile DB, through the project build tool, as ONE shell command from the repo root so both $$ expand to the same pid ' +
+    '(B is the first candidate board that is not Espressif — an Espressif board builds through idf.py, which writes a ' +
+    'compile DB per example under $D/<example>/ and none at $D): ' +
+    `D=cmake-build/cmake-build-pvs-$$ && B=$(for b in ${pvsBoards}; do [ -d hw/bsp/espressif/boards/$b ] || { echo $b; break; }; done) && ` +
+    'python3 tools/build.py -b $B --build-name pvs-$$ && ls $D/compile_commands.json ' +
+    '(--build-name keeps this run\'s tree private: a fixed name is clobbered by a concurrent validate run, and ' +
+    'cmake-build-<board> belongs to the parallel build agents; a missing lib/ or hw/mcu/ dependency means ' +
+    '`python3 tools/get_deps.py -b <board>` once, then retry). ' +
+    `Analyze the compile_commands.json that printed, then remove its build dir. Rules: .PVS-Studio/.pvsconfig. Base: ${base}.`,
+    { label, phase: 'Validate', agentType: 'pvs-studio', effort: 'low', schema: PVS },
   ).then(r => r ? {
     stage: name, pass: r.pass,
     detail: r.pass ? r.detail : clip(`${r.detail} ${JSON.stringify(r.changedFindings)}`),
   } : died).catch(() => died)
 
-  if (name === 'reviews') return () => {
-    const pending = reviewProvider === 'both'
-      ? parallel(['codex', 'claude'].map(provider => () => runReviewProvider(provider, label)))
-        .then(([codex, claude]) => ({ codex, claude }))
-      : runReviewProvider(reviewProvider, label).then(r => ({ [reviewProvider]: r }))
-    return pending.then(byProvider => {
-      const rows = []
-      if (reviewStageNames.includes('review')) rows.push(byProvider.claude ? {
-        stage: 'review', pass: byProvider.claude.pass &&
-          !byProvider.claude.findings.some(reviewBlocking),
-        findings: byProvider.claude.findings, detail: byProvider.claude.detail,
-      } : { stage: 'review', pass: false, findings: [], detail: 'stage agent died' })
-      if (reviewStageNames.includes('codex')) rows.push(byProvider.codex ? {
-        stage: 'codex', pass: byProvider.codex.pass &&
-          !byProvider.codex.findings.some(reviewBlocking),
-        findings: byProvider.codex.findings, detail: byProvider.codex.detail,
-      } : { stage: 'codex', pass: false, findings: [], detail: 'stage agent died' })
-      return rows
-    }).catch(() => reviewStageNames.map(stage => ({
-      stage, pass: false, findings: [], detail: 'stage agent died',
-    })))
-  }
+  if (name === 'review') return () => agent(reviewPrompt, {
+    label, phase: 'Validate', agentType: 'code-verifier', schema: REVIEW,
+  }).then(r => r ? {
+    stage: name, pass: r.pass && !r.findings.some(reviewBlocking),
+    findings: r.findings, detail: r.detail,
+  } : died).catch(() => died)
 
   throw new Error(`unknown stage ${name}`)
 }
@@ -236,7 +221,7 @@ function fixerEvidence(failures) {
       .filter(reviewBlocking)
       .slice(0, 10)
       .map(x => ({ ...x, summary: clip(x.summary, 300) }))
-    if (f.stage === 'review' || f.stage === 'codex')
+    if (f.stage === 'review')
       return { stage: f.stage, detail: clip(f.detail, 300), findings }
     return { stage: f.stage, detail: clip(f.detail) }
   })
@@ -245,7 +230,7 @@ function fixerEvidence(failures) {
 function fixThunkPrompt(cycle, failures) {
   return 'You are the fix agent of the validate loop, cycle ' + cycle + ', in this TinyUSB repo (work from the repo root). ' +
     'Failed stages: ' + failures.map(f => f.stage).join(', ') + '. ' +
-    'The JSON below carries their evidence (review findings are pre-verified CONFIRMED, codex ones are P0/P1):\n' +
+    'The JSON below carries their evidence (review findings are CONFIRMED P0/P1):\n' +
     JSON.stringify(fixerEvidence(failures), null, 1) + '\n\n' +
     'For each item: verify it against the actual code first; fix the real ones with the smallest correct change, matching surrounding style. ' +
     'Skip anything that is an infrastructure failure rather than a code defect (missing CLI, tool crash, dead stage agent) and anything you can refute with evidence — say which and why in summary. ' +
@@ -272,8 +257,8 @@ const history = []
 let toRun = new Set(stageNames)
 
 for (let cycle = 1; cycle <= maxCycles; cycle++) {
-  const ran = displayNames([...toRun])
-  log(`cycle ${cycle}/${maxCycles}: running ${ran.length}/${displayNames(stageNames).length} stage(s)`)
+  const ran = [...toRun]
+  log(`cycle ${cycle}/${maxCycles}: running ${ran.length}/${stageNames.length} stage(s)`)
   const batches = await parallel([...toRun].map(n => stageThunk(n, cycle)))
   const results = batches.flatMap(r => Array.isArray(r) ? r : [r]).filter(Boolean)
   for (const r of results) latest.set(r.stage, r)
@@ -304,7 +289,7 @@ for (let cycle = 1; cycle <= maxCycles; cycle++) {
     const deadStages = failures.filter(f => f.detail === 'stage agent died').map(f => f.stage)
     if (deadStages.length > 0) {
       log(`cycle ${cycle}: fix agent changed nothing — retrying dead stage(s): ${deadStages.join(', ')}`)
-      toRun = new Set(deadStages.map(scheduleName))
+      toRun = new Set(deadStages)
       continue
     }
     log(`cycle ${cycle}: fix agent changed nothing — stopping`)
@@ -353,8 +338,8 @@ for (let cycle = 1; cycle <= maxCycles; cycle++) {
   const docsOnly = trusted && files.length > 0 && files.every(f =>
     !f.startsWith('.claude/') && f !== 'CLAUDE.md' && f !== 'AGENTS.md' &&
     (/^docs\//.test(f) || f.endsWith('.md') || f.endsWith('.rst')))
-  toRun = new Set(failures.map(f => scheduleName(f.stage)))
-  if (reviewProvider) toRun.add('reviews')
+  toRun = new Set(failures.map(f => f.stage))
+  if (review) toRun.add('review')
   if (!docsOnly) for (const n of stageNames) toRun.add(n)
 }
 
