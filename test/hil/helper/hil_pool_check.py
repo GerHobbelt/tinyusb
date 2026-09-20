@@ -433,7 +433,7 @@ def build_example(board: dict, variant: str, example: str) -> int:
         cmd = ['idf.py', '-C', f'examples/{example}',
                '-B', f'cmake-build/cmake-build-{vcfg["name"]}/{example}',
                '-G', 'Ninja', f'-DBOARD={name}', 'build']
-        for d in board.get('build', {}).get('args', []) + vcfg.get('defines', []):
+        for d in vcfg.get('defines', []):
             cmd.insert(-1, f'-D{d}')
         if vcfg.get('flags'):
             cmd.insert(-1, f'-DCFLAGS_CLI={vcfg["flags"]}')
@@ -446,8 +446,6 @@ def build_example(board: dict, variant: str, example: str) -> int:
     cmd = [sys.executable, str(hil_util.TINYUSB_ROOT / 'tools' / 'build.py'),
            '-b', name, '-T', Path(example).name,
            '-j', str(max(1, (os.cpu_count() or _jobs) // _jobs))]
-    for d in board.get('build', {}).get('args', []):
-        cmd += ['-D', d]
     if vcfg['name'] != name:
         cmd += ['--build-name', vcfg['name']]
     for d in vcfg.get('defines', []):
@@ -985,9 +983,13 @@ def main() -> None:
     headers = ['Board', 'Probe', 'Flash', 'Device', 'Status', 'Note']
     cells = [[r['name'], r['probe'], r['flash'], r['device'],
               status_mark.get(r['status'], r['status']), '; '.join(r['note'])] for r in rows]
-    widths = [max(len(h), *(len(c[i]) for c in cells)) if cells else len(h)
+    # display_width, not len(): ✅ / ❌ / 🔒 / ⚠ are one character and two columns, so
+    # len() pads every row holding one a column short of the header rule
+    _w = hil_util.display_width
+    widths = [max(_w(h), *(_w(c[i]) for c in cells)) if cells else _w(h)
               for i, h in enumerate(headers)]
-    line = lambda vals: '| ' + ' | '.join(v.ljust(w) for v, w in zip(vals, widths)) + ' |'
+    line = lambda vals: ('| ' + ' | '.join(hil_util.pad(v, w)
+                                           for v, w in zip(vals, widths)) + ' |')
     print()
     print(line(headers))
     print('|' + '|'.join('-' * (w + 2) for w in widths) + '|')

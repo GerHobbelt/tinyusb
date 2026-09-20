@@ -3,6 +3,7 @@ name: hil-operator
 description: Run TinyUSB hardware-in-the-loop actions on the physical test rig — per-board locking, firmware flash, hil_test.py runs, USB recovery. Strictly one instance at a time. Never edits source; never touches the actions-runner service.
 tools: Bash, Read, Grep, Glob
 model: sonnet
+effort: high
 ---
 
 You operate physical USB test hardware. These repo skills are your source of truth — read the relevant one BEFORE acting:
@@ -68,12 +69,12 @@ For a board run, do NOT transcribe the report table. Run the tests, then hand ba
 output verbatim:
 
 ```bash
-python3 test/hil/helper/hil_summary.py <config> -b BOARD [-b BOARD...]   # from the report dir
+python3 test/hil/helper/hil_report.py <config> -b BOARD [-b BOARD...]   # from the report dir
 ```
 
-`{"results": <its results array, verbatim>, "banner": <its banner, verbatim>, "wedged": ["board", ...]}`
+`{"results": <its results array, verbatim>, "banner": <its banner, verbatim>, "caveat": <its caveat, verbatim>, "wedged": ["board", ...]}`
 
-`results` and `banner` are copied, never retyped, reworded or re-ordered: report rows are named
+`results`, `banner` and `caveat` are copied, never retyped, reworded or re-ordered (`caveat` is the run-level notice — abandoned, aborted, no-boards — and it can say the run failed while every row says pass): report rows are named
 per variant, a variant name need not start with the board name, and lock contention is a cell
 rather than a phrase, so re-deriving any of it by hand is how this contract broke before.
 `wedged` is yours — the boards your run left unresponsive, usually none — and the only field you

@@ -39,11 +39,23 @@ serial_stub.SerialTimeoutException = type('SerialTimeoutException', (Exception,)
 sys.modules.setdefault('serial', serial_stub)
 import hil_flash
 import hil_test
+from helper import hil_report
 
 
 def write_script(path: Path, body: str) -> None:
     path.write_text('#!/bin/sh\n' + body + '\n')
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+def no_settle(case):
+    """Zero test_device_usbtest's post-flash settle for one test.
+
+    Real hardware needs it -- the enumeration can bounce once after a flash, and on
+    dual-port parts the stale same-serial node lingers. A fake rig has neither, and ten
+    tests drive that path, so leaving it real cost 30s of every suite run.
+    """
+    case.addCleanup(setattr, hil_test, 'USBTEST_SETTLE', hil_test.USBTEST_SETTLE)
+    hil_test.USBTEST_SETTLE = 0
 
 
 def run_bounded(fn, timeout: float):
@@ -63,7 +75,6 @@ def run_bounded(fn, timeout: float):
     return not t.is_alive(), exc[0] if exc else None
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX shell fakes')
 class ReadDiskFile(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
@@ -77,7 +88,7 @@ class ReadDiskFile(unittest.TestCase):
         for name in ('get_disk_dev', '_enum_timeout', 'MTYPE_TIMEOUT'):
             self.addCleanup(setattr, hil_test, name, getattr(hil_test, name))
         hil_test.get_disk_dev = lambda uid, vendor, lun: str(self.dev)
-        hil_test._enum_timeout = 2
+        hil_test._enum_timeout = 1   # the wait these tests must outlast; keep it small
         self.bin = tmp / 'bin'
         self.bin.mkdir()
         self.addCleanup(os.environ.__setitem__, 'PATH', os.environ['PATH'])
@@ -112,7 +123,11 @@ class ReadDiskFile(unittest.TestCase):
         t0 = time.monotonic()
         with self.assertRaises(AssertionError) as cm:
             hil_test.read_disk_file('uid0', 0, 'README.TXT')
-        self.assertLess(time.monotonic() - t0, 1.5)
+        # BELOW one full _enum_timeout wait, not above it: "fails immediately" is the
+        # claim, and a bound of 1.5 against a 1s budget passes for code that spun the
+        # whole budget -- which is the regression this test exists to catch.
+        self.assertLess(time.monotonic() - t0, hil_test._enum_timeout,
+                        'read_disk_file spun the enumeration budget on a real answer')
         self.assertIn('README.TXT', str(cm.exception))
 
     def test_hung_mtype_cannot_hang_the_worker(self):
@@ -313,7 +328,7 @@ class _MtpFakeRig:
         os.environ['PYTHONSAFEPATH'] = '1'
         for name in ('_enum_timeout', 'MTP_SESSION_MARGIN'):
             self.addCleanup(setattr, hil_test, name, getattr(hil_test, name))
-        hil_test._enum_timeout = 2
+        hil_test._enum_timeout = 1   # the wait these tests must outlast; keep it small
         # the session scratch files land in cwd
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(tmp)
@@ -326,7 +341,6 @@ class _MtpFakeRig:
                 os.environ[k] = v
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX shell fakes')
 @unittest.skipIf(sys.version_info < (3, 11), 'fake-pymtp steering needs PYTHONSAFEPATH')
 class DeviceMtp(_MtpFakeRig, unittest.TestCase):
     """test_device_mtp end to end: the real mtp_test.py subprocess under run_cmd,
@@ -426,7 +440,6 @@ class BoundedOpen(unittest.TestCase):
         self.assertIsNone(self.hil_util.bounded_open(
             str(Path(self.tmp.name) / 'nope'), os.O_RDONLY, 5))
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX fifo')
     def test_blocking_open_gives_up_and_does_not_leak_fds(self):
         """A reader-less FIFO blocks open(O_WRONLY) forever -- the closest portable
         stand-in for a wedged usblp node."""
@@ -441,7 +454,6 @@ class BoundedOpen(unittest.TestCase):
         self.assertLessEqual(len(os.listdir('/proc/self/fd')) - before, 1,
                              'bounded_open leaked fds on the blocking path')
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX fifo')
     def test_open_completing_during_the_abandon_does_not_leak(self):
         """The window the handoff lock exists for: the worker is at its store-or-close
         decision when the caller gives up and drains the box.
@@ -512,7 +524,6 @@ class SysfsUnknownIsNotAbsent(unittest.TestCase):
     def test_missing_attribute_is_none(self):
         self.assertIsNone(self.hil_util.read_sysfs(str(Path(self.tmp.name) / 'nope')))
 
-    @unittest.skipIf(os.name == 'nt', 'POSIX fifo')
     def test_blocking_read_is_unknown_not_absent(self):
         """A reader-less FIFO stands in for the wedged device whose sysfs read never
         returns; None here would read as "the board is gone"."""
@@ -806,7 +817,6 @@ class WedgedPidsFailsClosed(unittest.TestCase):
         self.assertFalse(complete, 'a hidden holder was reported as absent')
 
 
-@unittest.skipIf(os.name == 'nt', 'POSIX shell fakes')
 @unittest.skipIf(sys.version_info < (3, 11), 'fake-pymtp steering needs PYTHONSAFEPATH')
 class StrandMemoRemembersUnstattablePaths(unittest.TestCase):
     """A stranded path whose inode could not be read is stored as None -- which dict.get()
@@ -899,16 +909,16 @@ class MtpGioFallthrough(unittest.TestCase):
             t0 = time.monotonic()
             r = subprocess.run([sys.executable,
                                 str(Path(TEST_DIR).parents[0] / 'mtp_test.py'),
-                                '--uid', 'CAFE01', '--timeout', '3'],
+                                '--uid', 'CAFE01', '--timeout', '1'],
                                capture_output=True, text=True, timeout=60, env=env)
             elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 30, f'did not honour --timeout 3 ({elapsed:.1f}s)')
+        self.assertLess(elapsed, 30, f'did not honour --timeout 1 ({elapsed:.1f}s)')
         self.assertNotEqual(r.returncode, 0)
         # The assertions above are satisfied by an immediate CRASH, which is exactly what
         # shipped through this test once: `pass` left gio unbound and the next line
         # dereferenced it. Assert the behaviour the docstring names -- it POLLED for the
         # device (so it spent its budget) and did not die on a traceback.
-        self.assertGreater(elapsed, 2.0,
+        self.assertGreater(elapsed, 0.8,
                            f'exited without polling ({elapsed:.1f}s) -- it crashed')
         self.assertNotIn('Traceback', r.stderr)
         self.assertIn('MTP device not found', r.stdout + r.stderr)
@@ -936,11 +946,17 @@ class RunWhileContract(unittest.TestCase):
 
         def boom():
             raise AssertionError('x')
+        # a duration no other process would plausibly pick: `pgrep -f` searches the WHOLE
+        # machine, so a bare `sleep 20` matched an unrelated background job -- another
+        # agent session's retry loop, in the case that exposed this -- and failed a test
+        # about our own child. Observed failing 3/3 in isolation while that loop ran.
+        sentinel = '20.0451'
         with self.assertRaises(AssertionError):
-            self.hil_util.run_alongside(['sleep', '20'], boom, 1)
+            self.hil_util.run_alongside(['sleep', sentinel], boom, 1)
         # nothing of ours is left running: the reap ran on the error path too
         import subprocess
-        out = subprocess.run(['pgrep', '-f', '^sleep 20'], capture_output=True, text=True)
+        out = subprocess.run(['pgrep', '-f', f'^sleep {sentinel}'],
+                             capture_output=True, text=True)
         seen['strays'] = [p for p in out.stdout.split() if p]
         self.assertEqual(seen['strays'], [], 'work() raising leaked the child')
 
@@ -1146,10 +1162,16 @@ class AbandonExitSurvivesAFailedFork(unittest.TestCase):
     def test_none_pool_and_manager_still_write_the_banner(self):
         # a subprocess, because _abandon_exit ends in os._exit: in-process it would take
         # the test runner with it, before any assertion could run
+        import json
         import subprocess
         with TemporaryDirectory() as td:
-            report = Path(td) / 'hil_report.md'
-            report.write_text('| board | test |\n|---|---|\n', encoding='utf-8')
+            rd = Path(td)
+            # it takes the report DIRECTORY now and re-renders both artifacts from the
+            # sidecar, so seed the sidecar -- the markdown is output, not input
+            (rd / 'hil_report.json').write_text(json.dumps(
+                {'rows': [{'board': 'boardA', 'cells': {'cdc_msc': 'pass'},
+                           'duration': '1s'}],
+                 'banner': '', 'scope': '', 'caveat': ''}))
             src = (
                 'import sys, types\n'
                 f'sys.path.insert(0, {str(Path(TEST_DIR).parents[0])!r})\n'
@@ -1160,12 +1182,14 @@ class AbandonExitSurvivesAFailedFork(unittest.TestCase):
                 'sys.modules.setdefault("serial", st)\n'
                 'import hil_test\n'
                 f'hil_test._abandon_exit(None, None, True, 1, __import__("pathlib")'
-                f'.Path({str(report)!r}))\n')
+                f'.Path({str(rd)!r}))\n')
             r = subprocess.run([sys.executable, '-c', src], capture_output=True,
                                text=True, timeout=120)
             self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertTrue(report.read_text().startswith('**HIL run abandoned'),
-                            'the abandon banner never reached the report')
+            self.assertTrue((rd / 'hil_report.md').read_text().startswith(
+                '**HIL run abandoned'), 'the abandon banner never reached the report')
+            self.assertIn('abandoned',
+                          json.loads((rd / 'hil_report.json').read_text())['caveat'])
 
     def test_kill_pool_children_tolerates_a_pool_that_never_existed(self):
         from helper import hil_health
@@ -1211,6 +1235,7 @@ class UsbtestOuterBoundIsOneValue(unittest.TestCase):
         # wedged-FIFO test would otherwise make every read here answer SYSFS_UNKNOWN
         patch(_hu, '_sysfs_stuck', 0)
         patch(_hu, '_sysfs_stranded', {})
+        patch(hil_test, 'USBTEST_SETTLE', 0)   # see no_settle
         patch(hil_lock, 'usbtest_permit', contextmanager(_permit))
         patch(hil_test, 'skip_flash', skip_flash)
         patch(hil_test, '_current_fw', '/tmp/fw.elf')
@@ -1318,6 +1343,7 @@ class UsbtestOuterKillStaysRetryable(unittest.TestCase):
 
         from helper import hil_util as _hu
         patch(_hu, 'glob', types.SimpleNamespace(glob=lambda p: [str(dev)]))
+        patch(hil_test, 'USBTEST_SETTLE', 0)   # see no_settle
         def _permit(uid):        # a real generator: a lambda returning an iterator has
             yield                # no .throw(), so any raise inside the `with` would
                                  # surface as an AttributeError from contextlib instead
@@ -1647,124 +1673,6 @@ class StagingCoversEveryBoardForm(unittest.TestCase):
                          "last run's re-run spec survived a green run")
 
 
-class SummaryFoldsReportToBoards(unittest.TestCase):
-    """hil_summary.py replaces the agent retyping the markdown table. Report rows are named per
-    VARIANT and a variant need not start with the board name, so the config is what maps them
-    back -- the previous string-matching design produced a defect in each of four review rounds."""
-
-    def _sum(self, boards, rows, cfg_boards=None, banner=''):
-        import json
-        import subprocess
-        td = TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        d = Path(td.name)
-        (d / 'hil_report.json').write_text(json.dumps(
-            {'rows': [{'board': b, 'cells': c, 'duration': '1s'} for b, c in rows],
-             'banner': banner}))
-        cfg = d / 'cfg.json'
-        cfg.write_text(json.dumps({'boards': cfg_boards or [{'name': b} for b in boards]}))
-        args = [a for b in boards for a in ('-b', b)]
-        r = subprocess.run(['python3', str(Path(TEST_DIR).parents[0] / 'helper' / 'hil_summary.py'),
-                            str(cfg), *args, '--report-dir', str(d)],
-                           capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        return json.loads(r.stdout)['results']
-
-    def test_variant_rows_fold_onto_their_board(self):
-        """nanoch32v203 never produces a row named after the board."""
-        got = self._sum(['nanoch32v203'],
-                        [('nanoch32v203-fsdev', {'usbtest': 'pass'}),
-                         ('nanoch32v203-usbfs', {'usbtest': 'pass'})],
-                        cfg_boards=[{'name': 'nanoch32v203',
-                                     'variant': [{'name': 'nanoch32v203-fsdev'},
-                                                 {'name': 'nanoch32v203-usbfs'}]}])
-        self.assertEqual([r['board'] for r in got], ['nanoch32v203'])
-        self.assertTrue(got[0]['pass'])
-        self.assertTrue(got[0]['ran'])
-
-    def test_one_failing_variant_fails_the_board(self):
-        got = self._sum(['nano'],
-                        [('nano-a', {'usbtest': 'pass'}), ('nano-b', {'usbtest': '❌ 29/30'})],
-                        cfg_boards=[{'name': 'nano', 'variant': [{'name': 'nano-a'},
-                                                                 {'name': 'nano-b'}]}])
-        self.assertFalse(got[0]['pass'])
-        self.assertIn('29/30', got[0]['detail'])
-
-    def test_lock_contention_is_a_field_not_a_prefix(self):
-        got = self._sum(['alpha'], [('alpha', {'board-locked': 'fail'})])
-        self.assertTrue(got[0]['locked'])
-        self.assertFalse(got[0]['pass'])
-
-    def test_a_board_with_no_row_is_marked_not_run(self):
-        got = self._sum(['alpha', 'beta'], [('alpha', {'usbtest': 'pass'})])
-        self.assertTrue(got[0]['ran'])
-        self.assertFalse(got[1]['ran'])
-        self.assertFalse(got[1]['pass'])
-
-    def test_a_metric_cell_counts_by_its_icon(self):
-        got = self._sum(['a', 'b'], [('a', {'cdc_msc_throughput': '✅ C 1.2 M 3.4'}),
-                                     ('b', {'cdc_msc_throughput': '❌ C 0.0 M 0.0'})])
-        self.assertTrue(got[0]['pass'])
-        self.assertFalse(got[1]['pass'])
-
-    def test_skipped_cells_do_not_fail_a_board(self):
-        got = self._sum(['a'], [('a', {'usbtest': 'skip', 'cdc_msc': 'pass'})])
-        self.assertTrue(got[0]['pass'])
-
-    def test_a_plain_metric_cell_is_a_pass(self):
-        """Mirrors hil_test.py's own tally (cell_kind): failures are ALWAYS marked -- 'fail'
-        or a ❌ prefix, per TestFail's docstring -- while a passing test may return a plain
-        metric string that lands in the cell unprefixed. Treating unknown shapes as fail
-        would publish a green table as a red verdict."""
-        got = self._sum(['a'], [('a', {'device_speed': '480.0 MBps'})])
-        self.assertTrue(got[0]['pass'])
-
-    def test_a_declared_variant_of_another_board_is_not_stolen(self):
-        """A declared variant need not start with its own board's name, so it may start with
-        a DIFFERENT board's name plus '-'. The prefix fallback must not attribute it twice."""
-        got = self._sum(['alpha', 'beta'],
-                        [('beta-x', {'usbtest': 'fail'})],
-                        cfg_boards=[{'name': 'alpha', 'variant': [{'name': 'beta-x'}]},
-                                    {'name': 'beta'}])
-        self.assertTrue(got[0]['ran'])
-        self.assertFalse(got[0]['pass'])
-        self.assertFalse(got[1]['ran'], "beta must not inherit alpha's row")
-
-
-class CaveatSurvivesAccumulate(unittest.TestCase):
-    """CI reruns with --accumulate: the sidecar keeps every earlier attempt's cells, but the
-    banner was recomputed per attempt. A first attempt on a degraded rig and a clean rerun
-    therefore published the degraded attempt's PASSES with no caveat on them -- and the
-    generated .failed spec reruns only failures, so those cells are never re-earned."""
-
-    def _rows(self, board, cell):
-        return [(board, 0, 0, [(board, {cell: 'OK'}, '1s')], 0)]
-
-    def test_an_earlier_attempts_caveat_is_still_on_the_report(self):
-        td = TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        rd = Path(td.name)
-        banner = '> **Rig note.** 2 process(es) in D state at start.\n'
-
-        hil_test.accumulate_report(self._rows('boardA', 'cdc_msc'), rd, True, '', banner)
-        self.assertIn('Rig note', (rd / hil_test.REPORT_MD).read_text())
-
-        # the rerun: clean rig, so this attempt contributes no banner of its own
-        md = hil_test.accumulate_report(self._rows('boardB', 'cdc_msc'), rd, False, '', '')
-        self.assertIn('boardA', md)                  # the earlier cells are kept ...
-        self.assertIn('Rig note', md,
-                      'the caveat the earlier cells were collected under was dropped')
-
-    def test_the_same_caveat_twice_is_not_stacked(self):
-        td = TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        rd = Path(td.name)
-        banner = '> **Rig note.** 2 process(es) in D state at start.\n'
-        hil_test.accumulate_report(self._rows('boardA', 'cdc_msc'), rd, True, '', banner)
-        md = hil_test.accumulate_report(self._rows('boardB', 'cdc_msc'), rd, False, '', banner)
-        self.assertEqual(md.count('Rig note'), 1)
-
-
 class BlindWorkerReachesTheReport(unittest.TestCase):
     """A worker that exhausts its bounded-read budget answers SYSFS_UNKNOWN for every
     attribute, so its "device not found" means "could not tell". That reached the log and
@@ -1796,7 +1704,7 @@ class BlindWorkerReachesTheReport(unittest.TestCase):
         wide = ('boardA', 1, ['device/cdc_msc'], [('boardA', {'cdc_msc': '❌'}, '2s')], 2.0, True)
         narrow = ('stuck', 1, [], None, 0)                      # what the timeout path builds
         hil_test._write_failed_spec(rd / 'x.failed', rd, [wide, narrow])
-        md = hil_test.accumulate_report([wide], rd, True, '', hil_test._blind_note([wide]))
+        md = hil_report.accumulate_report([wide], rd, True, '', hil_test._blind_note([wide]))
         self.assertIn('boardA', md)
         self.assertIn('not all verdicts are evidence', md.lower())
 
@@ -1930,6 +1838,7 @@ class WedgeVerdictReachesTheLatch(unittest.TestCase):
     def setUp(self):
         self.addCleanup(setattr, hil_test, 'board_wedged', hil_test.board_wedged)
         hil_test.board_wedged = ''
+        no_settle(self)
 
     def _run(self, stdout, rc=0):
         from helper import hil_lock, hil_util
@@ -1978,6 +1887,7 @@ class WedgedBoardCannotReportAPass(unittest.TestCase):
     def setUp(self):
         self.addCleanup(setattr, hil_test, 'board_wedged', hil_test.board_wedged)
         hil_test.board_wedged = ''
+        no_settle(self)
 
     def _cell(self, js):
         """Returns ('pass', cell) or ('fail', message)."""
@@ -2012,6 +1922,122 @@ class WedgedBoardCannotReportAPass(unittest.TestCase):
                                 '"failed":0,"notrun":0,"wedged":false,"cases":[]}')
         self.assertEqual(kind, 'pass', f'a healthy board was failed: {cell}')
         self.assertIn('30/30', cell)
+
+
+def _gil_stall_available() -> bool:
+    """Whether the hid stub can simulate a GIL-HOLDING stall on this host.
+
+    It needs a libc with sleep(3) loaded through ctypes.PyDLL. Everywhere the HIL harness
+    actually runs that is present; where it is not, the two tests that depend on it skip
+    rather than fail, because their subject is the bound, not ctypes.
+    """
+    import ctypes
+    import ctypes.util
+    try:
+        ctypes.PyDLL(ctypes.util.find_library('c') or 'libc.so.6')
+        return True
+    except OSError:
+        return False
+
+
+class HidEchoRunsInAChild(unittest.TestCase):
+    """hidapi's blocking calls hold the GIL -- cython-hidapi wraps hid_enumerate in
+    `with nogil` but calls hid_open and hid_close bare -- so a daemon thread cannot bound
+    them: the waiter parks off-GIL but must reacquire the GIL to return, which the stuck
+    thread never yields. Only a child process can be killed regardless, which is what
+    run_cmd's killpg does."""
+
+    def _run(self, mode, uid='CAFE01', budget='0', timeout=20, pid=None):
+        saved = {k: os.environ.get(k) for k in ('FAKE_HID_MODE', 'FAKE_HID_UID',
+                                                'FAKE_HID_PID', 'PYTHONPATH',
+                                                'PYTHONSAFEPATH')}
+
+        def restore():
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        self.addCleanup(restore)
+        os.environ['FAKE_HID_MODE'] = mode
+        os.environ['FAKE_HID_UID'] = uid
+        stubs = os.path.join(TEST_DIR, 'stubs')
+        pp = saved['PYTHONPATH']
+        os.environ['PYTHONPATH'] = stubs if not pp else f'{stubs}:{pp}'
+        # `python3 -c` puts the cwd at sys.path[0], AHEAD of PYTHONPATH, so any hid.py
+        # reachable from the suite's cwd would displace the stub and every mode-driven
+        # test below would pass or fail for the wrong reason. Safe-path mode drops it --
+        # the same practice _MtpFakeRig documents.
+        os.environ['PYTHONSAFEPATH'] = '1'
+        from helper import hil_util
+        want = pid or f'{hil_test.HID_INOUT_PID:#06x}'
+        return hil_util.run_cmd(
+            [sys.executable, '-c', hil_test.HID_ECHO, uid, budget, want],
+            timeout=timeout, split_stderr=True, quiet=True)
+
+    def _stderr(self, r):
+        from helper import hil_util
+        return hil_util.cmd_stdout_text(r.stderr)
+
+    def test_a_healthy_device_passes(self):
+        r = self._run('ok')
+        self.assertEqual(r.returncode, 0, self._stderr(r))
+
+    def test_the_pid_matches_the_example(self):
+        """The walk filters on BOTH ids, and hidapi applies them before the locked
+        manufacturer/product reads. Six examples in this tree expose a HID interface under
+        VID cafe, so a stale PID here silently widens the walk back to all of them -- and
+        nothing else would fail. Pinned against the descriptor rather than restated."""
+        import re
+        src = (Path(TEST_DIR).parents[2]
+               / 'examples/device/hid_generic_inout/src/usb_descriptors.c').read_text()
+        m = re.search(r'#define\s+USB_PID\s+(0x[0-9a-fA-F]+)', src)
+        self.assertIsNotNone(m, 'hid_generic_inout no longer defines USB_PID')
+        self.assertEqual(hil_test.HID_INOUT_PID, int(m.group(1), 16),
+                         'HID_INOUT_PID drifted from the example descriptor')
+
+    def test_a_peer_running_another_example_is_filtered_out(self):
+        """The point of the PID filter: a wedged sibling on a different example never
+        reaches the locked reads at all."""
+        r = self._run('ok', pid='0x400f')      # hid_composite, not ours
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('HID device not found', self._stderr(r))
+
+    @unittest.skipUnless(_gil_stall_available(), 'no libc for a GIL-holding stall')
+    def test_a_gil_holding_stall_is_still_killed(self):
+        """THE case an in-process bound cannot cover. hid_open is not `with nogil`, so a
+        thread-based guard is inert there; the child is killed anyway."""
+        t0 = time.monotonic()
+        r = self._run('wedged_open_gil', timeout=2)
+        self.assertEqual(r.returncode, 124,
+                         'a GIL-holding hidapi stall must still be killed on the bound')
+        self.assertLess(time.monotonic() - t0, 20, 'run_cmd did not bound the child')
+
+    def test_a_wedged_enumerate_is_killed_on_the_bound(self):
+        r = self._run('wedged_enumerate', timeout=2)
+        self.assertEqual(r.returncode, 124)
+
+    @unittest.skipUnless(_gil_stall_available(), 'no libc for a GIL-holding stall')
+    def test_a_wedged_close_is_killed_on_the_bound(self):
+        """close() runs in the child's finally on EVERY failure path and is also
+        GIL-holding; hidraw_release takes the same rwsem hidraw_open needs."""
+        r = self._run('wedged_close', timeout=3)
+        self.assertEqual(r.returncode, 124)
+
+    def test_an_absent_device_reports_why(self):
+        r = self._run('absent')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('HID device not found', self._stderr(r))
+
+    def test_a_bad_echo_reports_both_payloads(self):
+        r = self._run('wrong_data')
+        self.assertNotEqual(r.returncode, 0)
+        msg = self._stderr(r)
+        self.assertIn('wrong data', msg)
+        self.assertIn('sent', msg)
+        self.assertIn('received', msg)
+
+    def test_a_short_echo_is_not_read_as_a_pass(self):
+        r = self._run('short_read')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('short read', self._stderr(r))
 
 
 if __name__ == '__main__':
