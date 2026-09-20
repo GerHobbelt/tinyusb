@@ -9,10 +9,20 @@ Reference these instructions first; fall back to search/bash only when reality d
 Bias toward caution over speed. For trivial tasks, use judgment.
 
 - **Think first** — state assumptions; ask if unclear; when a choice matters, name it and recommend one rather than picking silently or surveying every option.
-- **Simplicity** — no features, abstractions, flexibility, or error handling beyond what was asked. If 200 lines could be 50, rewrite.
+- Follow YAGNI. Reuse existing code, standard-library, and native-platform features before adding dependencies or abstractions. Prefer the smallest clear solution, but never sacrifice correctness, safety, or necessary tests.
 - **Surgical changes** — touch only what the task requires; match existing style; don't refactor working code; mention unrelated dead code rather than deleting it. Remove only orphans *your* changes created.
 - **Goal-driven** — turn tasks into verifiable goals ("write failing test, make it pass"). For multi-step work, state a brief `step → verify` plan.
-- **Worktrees** — default to a git worktree for any branch or multi-step work; never switch the shared primary checkout's branch. Sessions run concurrently: switching the primary checkout mid-flight disrupts other sessions and can silently point a review, build, or commit at the wrong diff. Only trivial one-shot fixes may skip this. Standard location: `.worktrees/<branch-name>` at the repo root (gitignored), e.g. `git worktree add .worktrees/my-branch -b my-branch`. In a new worktree, symlink the dependency dirs (`lib/*`, `hw/mcu/*`, `tools/linkermap` — the keys of `deps_all` in `tools/get_deps.py`) to the primary checkout instead of re-cloning them; only if the branch needs a different dep revision, replace that one symlink with a real dir and run `get_deps.py` for it.
+- **Worktrees** — For branch or multi-step work, run `git worktree add .worktrees/<branch> -b <branch>`; never switch the primary checkout. Symlink the `deps_all` paths from `tools/get_deps.py` to the primary checkout; replace only a dependency that needs a different revision, then run `get_deps.py` for it.
+
+## Claude and Codex Collaboration
+
+Claude Code is the primary harness. `CLAUDE.md` and `.claude/{agents,skills,workflows}` are canonical; `AGENTS.md -> CLAUDE.md` and `.agents -> .claude` expose the same instructions and skills to standalone Codex. `.codex/agents/*.toml` are thin adapters that pin Codex models and load the canonical Markdown roles; do not copy role bodies or maintain other Codex-specific mirrors.
+
+- Use `/codex:review` for an independent read-only review and `/codex:adversarial-review` to challenge the implementation or design.
+- Use `/codex:rescue` for substantial bounded implementation, diagnosis, or a second pass when Claude is stuck; use its `--background`, `--resume`, and `--fresh` controls when needed.
+- When Codex should use a named TinyUSB role, select its `.codex/agents/<role>.toml` adapter; the adapter loads `.claude/agents/<role>.md` as the canonical role.
+- Reviews and research may run beside Claude. For write-capable delegation, use a separate worktree if Claude continues editing; otherwise yield the current worktree to Codex until it finishes. Never let both edit overlapping files in one worktree.
+- `.claude/workflows/*.js` remain the canonical Claude Code orchestration. Root workflows route `code-verifier` work through `code-verify`: Codex by default, or Claude/both when selected. Because workflows nest only one level, `validate` dispatches the same verifier agents directly when called by `full-check`. The Codex subprocess lives only in `.claude/agents/codex-code-verifier.md`; never copy it into a workflow.
 
 ## Ground Rules
 
