@@ -707,7 +707,7 @@ def flasher_names():
 
 class FlashPrimitive(unittest.TestCase):
     """hil_flash.flash_primitive is the one flash dispatch: hil_test, usbtest,
-    hil_pool_check and hil_recover all resolve a flasher's flash_* through it."""
+    hil_pool_check all resolve a flasher's flash_* through it."""
 
     def test_every_flasher_resolves_to_its_flash(self):
         names = flasher_names()
@@ -726,7 +726,7 @@ class FlashPrimitive(unittest.TestCase):
 
 
 class ResetPrimitive(unittest.TestCase):
-    """hil_flash.reset_primitive is the one reset dispatch: usbtest, hil_recover,
+    """hil_flash.reset_primitive is the one reset dispatch: usbtest,
     hil_pool_check and hil_test all resolve a flasher's reset through it."""
 
     def test_a_flasher_without_a_reset_only_mode_has_none(self):
@@ -749,7 +749,7 @@ class ResetPrimitive(unittest.TestCase):
             hil_flash.reset_primitive('nosuchflasher')
 
     def test_every_real_reset_takes_the_callers_bound(self):
-        """usbtest and hil_recover call every reset primitive with timeout=, unguarded: one
+        """usbtest calls every reset primitive with timeout=, unguarded: one
         without the parameter never resets, its TypeError logged as a reset that raised.
         Flashers are enumerated by their flash_* half, so reset_primitive itself is not one."""
         names = flasher_names()
@@ -856,6 +856,45 @@ class FlasherRecoverEntry(unittest.TestCase):
         self.assertIn('JLinkExe -USB S1', cmd)
         self.assertEqual(kw.get('timeout'), 11)
 
+    @staticmethod
+    def _jlink_runs(fn, rcs, *args, took=0, **kw):
+        """Run fn with run_cmd answering rcs in turn, each call taking `took` s on a fake clock;
+        return the rc and each call's timeout."""
+        from unittest import mock
+        timeouts, rc_iter = [], iter(rcs)
+        now = [0.0]
+
+        def fake(cmd, **k):
+            timeouts.append(k.get('timeout'))
+            now[0] += took
+            return subprocess.CompletedProcess(cmd, next(rc_iter), '', '')
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(hil_flash.hil_util, 'run_cmd', fake), \
+                mock.patch.object(hil_flash, 'time', types.SimpleNamespace(monotonic=lambda: now[0])):
+            os.chdir(d)
+            try:
+                ret = fn(*args, **kw)
+            finally:
+                os.chdir(cwd)
+        return ret.returncode, timeouts
+
+    def test_jlink_reruns_a_crash_within_the_callers_bound(self):
+        board = {'name': 'b', 'flasher': {'name': 'jlink', 'uid': 'S1', 'args': '-device x'}}
+        self.assertEqual(self._jlink_runs(hil_flash.flash_jlink, [139, -6, 0], board, '/tmp/fw.hex',
+                                          timeout=30, took=10), (0, [30, 20, 10]))
+        # no caller bound: the three runs share run_cmd's default one
+        cap = hil_flash.hil_util.CMD_TIMEOUT
+        self.assertEqual(self._jlink_runs(hil_flash.reset_jlink, [134, -11, 139], board, took=1),
+                         (139, [cap, cap - 1, cap - 2]))
+        # the bound is spent: no rerun
+        self.assertEqual(self._jlink_runs(hil_flash.reset_jlink, [139], board, timeout=5, took=5), (139, [5]))
+
+    def test_jlink_does_not_rerun_other_failures(self):
+        board = {'name': 'b', 'flasher': {'name': 'jlink', 'uid': 'S1', 'args': '-device x'}}
+        for rc in (1, 124):
+            self.assertEqual(self._jlink_runs(hil_flash.reset_jlink, [rc], board, timeout=5), (rc, [5]))
+
     def test_reset_stlink_forwards_the_callers_bound(self):
         """reset_stlink forwards timeout= to run_cmd; the default stays run_cmd's."""
         board = {'name': 'b', 'flasher': {'name': 'stlink', 'uid': 'S1'}}
@@ -870,9 +909,9 @@ class FlasherRecoverEntry(unittest.TestCase):
         probe as its jlink primary and dispatches. The set is the boards whose reset over
         openocd+jlink was demonstrated on their roster's rig, and flash too wherever openocd can
         flash the part (ci.lan 2026-08-17, 2026-09-21 and 2026-09-22, tusb 2026-09-21 for
-        lpcxpresso43s67); a reset-only entry says so in its `note`. A new one is added only
+        lpcxpresso43s67). A new one is added only
         after the same demonstration. frdm_k64f is host-only, so usbtest never marks
-        it; its entry lets a dispatched rung-1 reset skip the shield. Left out, and why: stm32f769disco (probe not on the rig to demonstrate), ra4m1_ek (reset-only
+        it; its entry serves a manual reset through the recovery flasher. Left out, and why: stm32f769disco (probe not on the rig to demonstrate), ra4m1_ek (reset-only
         worked ~80% under openocd, SYSRESETREQ or srst, where JLinkExe resets 5/5; 2026-09-22).
         mimxrt1064_evk and lpcxpresso55s28 are reset-only: openocd 0ce743125 has no target cfg and
         no flash driver for them (FlexSPI, LPC55), so their entries declare a bare SWD DAP and
@@ -880,9 +919,8 @@ class FlasherRecoverEntry(unittest.TestCase):
         lpcxpresso55s28 logs "DP initialisation failed" after each reset yet resets. Same trade as
         nrf54lm20dk below. nrf54lm20dk's reset works (libjaylink 0.5.0 finds its PID 0x1069; 0.4.0 did
         not) but its reflash cannot: nrf54l.cfg declares no RRAM flash bank. Accepted trade:
-        the entry arms in-run recovery (a reset) where JLinkExe allowed none, but replaces the
-        post-run fallback, which was a shielded JLinkExe reflash, with one that fails and
-        leaves the chip halted; a wedge the reset does not clear stays marked. The STM32 entries empty
+        the entry arms in-run recovery (a reset) where JLinkExe allowed none; a wedge the reset
+        does not clear stays wedged for the run. The STM32 entries empty
         their target's reset-init event: stm32f0x/f4x/f7x/l4x.cfg set `adapter speed 8000` there,
         these on-board J-Link probes cap at 4000 and fail even at 4000 (auto_probe failed, SWD
         parity mismatch; stm32f407disco and stm32f072disco, 2026-09-22), and `program` runs
@@ -916,11 +954,6 @@ class FlasherRecoverEntry(unittest.TestCase):
             self.assertIn('interface/jlink.cfg', rec['args'], name)
             self.assertIn('transport select swd', rec['args'], name)
             stm32 = re.search(r'-f target/(stm32(?:f0|f4|f7|l4)x)\.cfg', rec['args'])
-            self.assertEqual(rec.get('note', '').startswith('reset only'),
-                             name in reset_only or name == 'nrf54lm20dk', f'{name}: reset-only note')
-            # machine-readable twin of the note: hil_recover skips the reflash on it
-            self.assertEqual(rec.get('reflash', True), not rec.get('note', '').startswith('reset only'),
-                             f'{name}: "reflash": false iff the note says reset only')
             if name in reset_only:
                 self.assertEqual(rec['args'], reset_only[name])
             elif stm32:
@@ -1120,8 +1153,7 @@ class TestTypecRule(unittest.TestCase):
 class TestCachesAreKeyedOnTheTree(unittest.TestCase):
     """build_utils caches on repo-RELATIVE paths while ci_select._in_repo() chdirs
     between trees, so the cwd has to be part of every cache key. Without it a second
-    tree gets the first tree's skip.txt/only.txt and FAMILY_MCUS - which is exactly the
-    base-vs-branch comparison the code-size skill does in one process."""
+    tree gets the first tree's skip.txt/only.txt and FAMILY_MCUS."""
 
     def test_a_second_tree_is_not_answered_from_the_first(self):
         import build_utils, tempfile
@@ -1216,22 +1248,21 @@ class TestTheHarnessTestsAreNotTheHarness(unittest.TestCase):
             'test/hil/test/test_ci_boards.py',
             'test/hil/test/test_ci_metrics.py',
             'test/hil/test/test_ci_select.py',
+            'test/hil/test/test_code_size.py',
             'test/hil/test/test_drivers_coverage.py',
             'test/hil/test/test_family_json.py',
             'test/hil/test/test_hil_args.py',
             'test/hil/test/test_hil_bounded.py',
-            'test/hil/test/test_hil_health.py',
-            'test/hil/test/test_hil_recover.py',
+            'test/hil/test/test_hil_mtp_raw.py',
+            'test/hil/test/test_hil_pool_check.py',
             'test/hil/test/test_hil_remote.py',
             'test/hil/test/test_hil_report.py',
             'test/hil/test/test_hil_reset_order.py',
             'test/hil/test/test_hil_rtt.py',
             'test/hil/test/test_hil_usbtest_id.py',
+            'test/hil/test/test_hil_usbtest_verdict.py',
             'test/hil/test/test_hil_util.py',
-            'test/hil/test/test_membrowse_compare.py',
-            'test/hil/test/test_membrowse_onboard.py',
-            'test/hil/test/test_membrowse_report.py',
-            'test/hil/test/test_metrics_compare_base.py',
+            'test/hil/test/test_membrowse_cli.py',
             'test/hil/test/usbtest_harness.py',
         ], 'test/hil/test/ gained or lost a file; it is carved out of rule 2, so confirm '
            'the rig still does not read anything in there before updating this list')
@@ -1895,7 +1926,7 @@ class TestBuildPostFilter(unittest.TestCase):
 
     def test_espressif_prunes_to_what_its_build_path_can_build(self):
         # build.py's espressif branch builds get_examples('espressif') only (the
-        # *_freertos examples plus a short extra list), so keeping espressif for a
+        # examples with an ESP-IDF component), so keeping espressif for a
         # device/cdc_msc diff spins CircleCI's most expensive leg up to skip everything
         s = ci_select.classify_build(['examples/device/cdc_msc/src/main.c'], REPO)
         self.assertFalse(s['full'])
@@ -1956,14 +1987,13 @@ class TestBuildPostFilter(unittest.TestCase):
 
 class TestNoContributionPaths(unittest.TestCase):
     """Paths that are inside build.yml's code filter but cannot change a compiled byte.
-    Unclassified means FULL on both axes, so a metrics-only PR would otherwise cost the
+    Unclassified means FULL on both axes, so a size/coverage-tooling-only PR would otherwise cost the
     whole build matrix plus an exclusive full-rig sweep - where master ran nothing."""
 
-    def test_metrics_scripts_contribute_nothing_on_either_axis(self):
+    def test_local_tooling_contributes_nothing_on_either_axis(self):
         # no CI build and no rig board runs any of these (drivers_coverage_check.py is
         # pre-commit only)
-        for p in ('tools/metrics.py', 'tools/membrowse_onboard.py',
-                  'tools/membrowse_compare.py', 'tools/drivers_coverage_check.py'):
+        for p in ('tools/code_size.py', 'tools/drivers_coverage_check.py'):
             h = sel([p])
             self.assertFalse(h['full'], p)
             self.assertEqual(h['boards'], {}, p)
@@ -1974,6 +2004,14 @@ class TestNoContributionPaths(unittest.TestCase):
     def test_ci_boards_json_is_full_build_no_hil(self):
         # decides which boards a family's build legs compile; no rig board depends on it
         p = '.github/ci-pinned-boards.json'
+        h = sel([p])
+        self.assertFalse(h['full'], p)
+        self.assertEqual(h['boards'], {}, p)
+        self.assertTrue(ci_select.classify_build([p], REPO)['full'], p)
+
+    def test_membrowse_cli_is_a_full_build_matrix_without_hil(self):
+        # run by family_add_membrowse() for every pinned board (rule 2d)
+        p = 'tools/membrowse_cli.py'
         h = sel([p])
         self.assertFalse(h['full'], p)
         self.assertEqual(h['boards'], {}, p)
@@ -2369,7 +2407,7 @@ class TestBuildPyExampleFilter(unittest.TestCase):
         # CI run, since idf.py never ran 'all' here) used to print "no build dir" and
         # skip - silently uploading nothing, unlike every other CI board, which still
         # gets an --identical upload via its cheap `cmake` configure. This target must
-        # instead invoke membrowse_report.py directly (its --identical path needs
+        # instead invoke `membrowse_cli.py report` directly (its --identical path needs
         # neither idf.py nor a build dir) rather than going through idf.py/cmake.
         calls = []
         def fake_run(cmd):
@@ -2387,13 +2425,14 @@ class TestBuildPyExampleFilter(unittest.TestCase):
         self.assertEqual(r, [1, 0, 0])
         self.assertEqual(len(calls), 1)
         cmd = calls[0]
-        self.assertIn('membrowse_report.py', cmd[1])
+        self.assertIn('membrowse_cli.py', cmd[1])
+        self.assertEqual(cmd[2], 'report')
         self.assertNotIn('idf.py', cmd[0])
         self.assertIn('--upload', cmd)
         self.assertEqual(cmd[cmd.index('--target-name') + 1],
                          'espressif_s3_devkitc/cdc_msc_freertos')
         # the whole point: --elf names the file the (absent) build dir would hold, so
-        # membrowse_report.py's own elf-missing check takes the --identical branch
+        # `membrowse_cli.py report`'s own elf-missing check takes the --identical branch
         self.assertEqual(cmd[cmd.index('--elf') + 1],
                          'cmake-build/cmake-build-espressif_s3_devkitc/device/cdc_msc_freertos/cdc_msc_freertos.elf')
 

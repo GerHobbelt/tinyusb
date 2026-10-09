@@ -102,13 +102,9 @@ static void update_in(uint8_t rhport, uint8_t ep_num, bool force) {
   }
 }
 
-static void update_out(uint8_t rhport, uint8_t ep_num, uint16_t rx_len, bool is_tog_ok) {
+static void update_out(uint8_t rhport, uint8_t ep_num, uint16_t rx_len) {
   xfer_ctl_t* xfer = XFER_CTL_BASE(ep_num, TUSB_DIR_OUT);
   if (!xfer->valid) {
-    return;
-  }
-
-  if (!is_tog_ok && ep_num != 0 && !xfer->is_iso) {
     return;
   }
 
@@ -141,7 +137,6 @@ static void update_out(uint8_t rhport, uint8_t ep_num, uint16_t rx_len, bool is_
 
 bool dcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init) {
   (void)rhport;
-  (void)rh_init;
 
   memset(&xfer_status, 0, sizeof(xfer_status));
   ep0_tog = true;
@@ -152,12 +147,15 @@ bool dcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init) {
 
   USBHSD->CONTROL = 0;
 
-  #if TUD_OPT_HIGH_SPEED
-  USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_HIGH_SPEED;
-  #else
-    #error OPT_MODE_FULL_SPEED not currently supported on CH32
-  USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_FULL_SPEED;
-  #endif
+  if (rh_init->speed == TUSB_SPEED_HIGH || rh_init->speed == TUSB_SPEED_AUTO) {
+    USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_HIGH_SPEED;
+  } else if (rh_init->speed == TUSB_SPEED_FULL) {
+    USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_FULL_SPEED;
+  } else if (rh_init->speed == TUSB_SPEED_LOW) {
+    USBHSD->CONTROL = USBHS_DMA_EN | USBHS_INT_BUSY_EN | USBHS_LOW_SPEED;
+  } else {
+    return false;
+  }
 
   USBHSD->INT_EN = 0;
   USBHSD->INT_EN = USBHS_SETUP_ACT_EN | USBHS_TRANSFER_EN | USBHS_BUS_RST_EN | USBHS_SUSPEND_EN;
@@ -421,19 +419,21 @@ void dcd_int_handler(uint8_t rhport) {
         uint32_t frame_count = USBHSD->FRAME_NO & USBHS_FRAME_NO_NUM_MASK;
         dcd_event_sof(rhport, frame_count, true);
       }
-    } else if (token == USBHS_TOKEN_PID_OUT) {
+    // Drop an OUT packet whose data toggle doesn't match what we expect -- a host retransmit
+    // after a lost ACK, or a host that doesn't alternate DATA0/DATA1.
+    } else if (token == USBHS_TOKEN_PID_OUT && (int_status & USBHS_DEV_UIS_TOG_OK)) {
       if (ep_num != 0) {
         // Release early: ISO transfers ignore INT_BUSY and would overwrite
         // the shared INT_ST/RX_LEN of this pending completion.
         xfer_ctl_t const *const out = XFER_CTL_BASE(ep_num, TUSB_DIR_OUT);
         // Keep the receive armed if update_out() rejects this packet's toggle.
-        if (!out->is_iso && (int_status & USBHS_TOG_MATCH) != 0) {
+        if (!out->is_iso) {
           EP_RX_CTRL(ep_num) = (EP_RX_CTRL(ep_num) & ~(USBHS_EP_R_RES_MASK)) | USBHS_EP_R_RES_NAK;
         }
         USBHSD->INT_FG = USBHS_TRANSFER_FLAG;
         released = true;
       }
-      update_out(rhport, ep_num, len, (int_status & USBHS_TOG_MATCH) != 0);
+      update_out(rhport, ep_num, len);
     } else if (token == USBHS_TOKEN_PID_IN) {
       if (ep_num != 0) {
         // Release early, as for OUT.

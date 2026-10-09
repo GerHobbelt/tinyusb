@@ -16,6 +16,26 @@ SUCCEEDED = "\033[32msucceeded\033[0m"
 FAILED = "\033[31mfailed\033[0m"
 SKIPPED = "\033[33mskipped\033[0m"
 
+# a compiler/linker diagnostic first; CMake's own error next; never ninja's FAILED: wrapper
+DIAGNOSTIC = re.compile(r'^\S+:\d+(?::\d+)?: (?:fatal )?error:|undefined reference to|multiple definition of'
+                        r'|will not fit in region|region \S+ overflowed by|ld: cannot find')
+CMAKE_ERROR = re.compile(r'^CMake Error')
+
+
+def first_error(out):
+    """A build output's first compiler/linker diagnostic line, else its first CMake error
+    with the indented message line under it; None when there is neither."""
+    lines = out.splitlines()
+    hit = next((l.strip() for l in lines if DIAGNOSTIC.search(l.strip())), None)
+    if hit:
+        return hit
+    for i, line in enumerate(lines):
+        if CMAKE_ERROR.match(line.strip()):
+            error = line.strip()
+            below = next((l for l in lines[i + 1:] if l.strip()), '')
+            return f'{error} {below.strip()}' if error.endswith(':') and below[:1].isspace() else error
+    return None
+
 
 # Every read here is a source file, not user text: decode it the same way on every
 # machine. Without this the reads take the locale's encoding, and one of the eight
@@ -38,8 +58,8 @@ def _cwd_cache(fn):
 
     Every cached helper below takes repo-RELATIVE paths ('hw/bsp/<fam>',
     'examples/<ex>/skip.txt', or the literal 'hw/bsp' glob), while ci_select._in_repo()
-    chdirs around each call so one process can classify more than one tree - the
-    code-size skill's base-vs-branch worktrees, a test pointing at a fixture.
+    chdirs around each call so one process can classify more than one tree (e.g. a
+    test fixture).
     Without the cwd in the key the second tree silently gets the first tree's
     skip.txt/only.txt and FAMILY_MCUS answers. Master had no caching here, so this
     hazard arrived with it."""
@@ -423,7 +443,8 @@ def dep_head(path):
     a checkout broken partway - where the revision built is anybody's guess."""
     if not (path / '.git').exists():
         return None
-    r = subprocess.run(['git', '-C', str(path), 'rev-parse', 'HEAD'], capture_output=True, text=True)
+    # --git-dir, not -C: a hook's inherited GIT_DIR outranks -C and names the enclosing repo
+    r = subprocess.run(['git', '--git-dir', str(path / '.git'), 'rev-parse', 'HEAD'], capture_output=True, text=True)
     head = r.stdout.strip()
     return head if r.returncode == 0 and head else HEAD_UNKNOWN
 

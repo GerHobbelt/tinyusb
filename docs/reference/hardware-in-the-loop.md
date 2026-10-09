@@ -172,7 +172,7 @@ written is expected — it busy-waits over PCI config space for ~30 s.
 |-----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | Build                       | `cmake`, `ninja-build`, and a toolchain per family: `gcc-arm-none-eabi`, a RISC-V GCC, ESP-IDF                                            |
 | Flashing                    | Five tools, one per `Flasher` value — see below                                                                                           |
-| Test harness                | `pip install -r test/hil/requirements.txt` — hidapi, pyserial, esptool                                                                    |
+| Test harness                | `pip install -r test/hil/requirements.txt` — hidapi, pyserial, esptool, pyusb (the raw MTP cases)                                         |
 | Host-side test tools        | `dfu-util`, `mtools`, `libmtp9`, `libmtp-runtime`, `alsa-utils` (apt) — the DFU, MSC, MTP and audio tests shell out to these              |
 | USB inspection and recovery | `pciutils` (the `usbtest` firmware gate), `uhubctl` (apt), `tshark` for usbmon capture, `testusb` from the kernel's `tools/usb/testusb.c` |
 
@@ -218,9 +218,6 @@ Actions runner nor `hil_remote.py` sources a login profile. Keep them in `~/.loc
 `pciutils` and passwordless sudo are hard requirements, not conveniences:
 `test/hil/usbtest.py` shells out as `sudo -n` for `setpci`, `modprobe`, `dmesg` and
 `testusb`, and exits outright if it cannot read the host controller's firmware version.
-`helper/hil_pool_check.py` gates recovery on the same `sudo -n` plus
-`.claude/skills/usb-kernel-recover/scripts/usb_recover.sh` being present; without both it
-cannot re-authorize a wedged probe's port and files the board `flash-failed` instead.
 
 The `usbtest` battery additionally needs `testusb` built from the kernel tools and
 `CONFIG_USB_TEST=m` available.
@@ -333,7 +330,7 @@ Host-side prerequisites, beyond a cross toolchain:
 
 ```bash
 python3 tools/get_deps.py <family>            # MCU SDKs for your boards
-pip install -r test/hil/requirements.txt      # hidapi, pyserial, esptool
+pip install -r test/hil/requirements.txt      # hidapi, pyserial, esptool, pyusb
 sudo apt install cmake ninja-build uhubctl \
                  dfu-util mtools libmtp9 libmtp-runtime alsa-utils
 ```

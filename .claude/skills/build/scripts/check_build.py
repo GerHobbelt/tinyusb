@@ -8,7 +8,8 @@ Scope resolution goes through tools/ci_select.py: one board per affected family
 (a rig-roster board of that family first, else the first in hw/bsp/<family>/boards,
 preferring one that builds an example the change affects), plus one more board per
 changed driver none of them compiles by its hw/bsp/family.json row, or the
-representative pair when the selection is the full matrix. Each board builds through
+representative pair when the selection is the full matrix. Drivers without USB-IP
+guards add a compiling board per MCU_VARIANT of the family. Each board builds through
 tools/build.py in a private cmake-build-agent-<pid> dir; --shared uses the canonical
 cmake-build-<board> that HIL flashes from, must not be shared with a parallel agent,
 and is refused when it still carries an option from an earlier configure this run does not set.
@@ -51,9 +52,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 HIL_CONFIG = ROOT / 'test' / 'hil' / 'tinyusb.json'
 FULL_MATRIX_BOARDS = ['stm32f407disco', 'raspberry_pi_pico']
-# a compiler/linker diagnostic first; CMake's own error next; never ninja's FAILED: wrapper
-DIAGNOSTIC = re.compile(r'^\S+:\d+(?::\d+)?: (?:fatal )?error:|undefined reference to|multiple definition of')
-CMAKE_ERROR = re.compile(r'^CMake Error')
 BOARD_PATH = re.compile(r'^hw/bsp/([^/]+)/boards/([^/]+)/')
 ROW = re.compile(r'^\|\s*(\S+)\s*\|\s*(.+?)\s*\|\s*\x1b\[\d+m(OK|Failed|Skipped)\x1b\[0m', re.M)
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -181,9 +179,12 @@ def representatives(candidates, examples, drivers=(), keep=()):
     the driver, selects the USB IPs its guard names where the probe can say, and its row
     and own cmake turn on no option the guard negates and leave off none of the per-board
     ones it requires: hcd_dwc2.c is empty on a MAX3421 board, hcd_rp2040.c on a PIO-USB
-    one, hcd_pio_usb.c on a board that is neither), plus a
-    plain first pick when that leaves nothing. A candidate that compiles one of the affected examples
-    is preferred, the criterion dropped rather than returning nothing when it leaves no
+    one, hcd_pio_usb.c on a board that is neither). Drivers without USB-IP guards need
+    one compiling board per MCU_VARIANT in board.cmake; boards without it share one
+    group. The missing guard is a deliberate selection proxy for variant-dependent code,
+    not a claim that guarded drivers have no variant-specific behaviour. Add a plain
+    first pick when that leaves nothing. A candidate that compiles
+    one of the affected examples is preferred, the criterion dropped when it leaves no
     candidate: ci_select keeps a family when ANY of its boards builds the selection under
     EITHER build system, so the first candidate can be one skipped for every affected
     example (samd11's cynthion_d11 is skip.txt'd out of device/mtp) and verify none of the
@@ -206,11 +207,14 @@ def representatives(candidates, examples, drivers=(), keep=()):
         pool = [b for b in pool if builds_any(b)] or pool
     picked = list(keep)
     for driver in sorted(drivers):
-        if any(compiles(b, driver) for b in picked):
-            continue
-        hit = next((b for b in pool if compiles(b, driver)), None)
-        if hit:
-            picked.append(hit)
+        src = str(ROOT / 'src' / 'portable' / driver)
+        group = (lambda b: None) if source_usbips(src) else board_mcu_variant
+        covered = {group(b) for b in picked if compiles(b, driver)}
+        for board in pool:
+            variant = group(board)
+            if variant not in covered and compiles(board, driver):
+                picked.append(board)
+                covered.add(variant)
     return picked or [pool[0]]
 
 
@@ -230,8 +234,7 @@ CMAKE_FALSE = {'', '0', 'OFF', 'NO', 'FALSE', 'N', 'IGNORE', 'NOTFOUND'}
 def source_usbips(src):
     """What one driver's body needs defined, read off the `defined(TUP_USBIP_*)` conjuncts
     of the first #if guard naming one (a negated or bracketed term is not a conjunct and
-    is left out). Empty for a driver no TUP_USBIP gates (rp2040, nrf5x), which its family
-    compiles outright."""
+    is left out). Empty for a driver no TUP_USBIP gates (rp2040, nrf5x)."""
     try:
         text = Path(src).read_text(encoding='utf-8', errors='replace')
     except OSError:                  # a file the change deletes is still in the diff
@@ -312,6 +315,17 @@ def board_usbips(board):
     return ips
 
 
+def board_cmake_path(board):
+    return ROOT / 'hw' / 'bsp' / family_of(board) / 'boards' / board / 'board.cmake'
+
+
+@functools.lru_cache(maxsize=None)
+def board_mcu_variant(board):
+    """The board.cmake MCU_VARIANT, or None for the shared unset group."""
+    values = tools_build.build_utils._cmake_set_values(board_cmake_path(board), 'MCU_VARIANT')
+    return values[0] if values else None
+
+
 @functools.lru_cache(maxsize=None)
 def board_cmake_options(board):
     """The CFG_ options a board's own board.cmake turns on. A row's `defines` hold only
@@ -320,9 +334,8 @@ def board_cmake_options(board):
     hcd_rp2040.c's guard negates, and its row's `defines` are empty. Scraped rather than
     observed, which only a selection may do - a candidate is rejected, never accepted, on
     this, and the body test after the build is still the verdict."""
-    path = ROOT / 'hw' / 'bsp' / family_of(board) / 'boards' / board / 'board.cmake'
     try:
-        text = path.read_text(encoding='utf-8', errors='replace')
+        text = board_cmake_path(board).read_text(encoding='utf-8', errors='replace')
     except OSError:                  # Make-only board, or a family whose cmake is elsewhere
         return frozenset()
     return frozenset(m.group(1) for m in BOARD_CMAKE_SET.finditer(text)
@@ -563,9 +576,10 @@ def coverage(reasons, scope, results, chosen=False, targets=()):
     named examples is a gap when no board wrote an elf for any of them; a core stack path
     names every example of its role; any other contributing path is a gap when the run
     produced no elf at all (-T help is a green build of nothing). A path whose reason names
-    a build target rather than families or examples (tools/membrowse_report.py is verified
-    by examples-membrowse-upload) is a gap unless the run selected that target: the default
-    sweep builds `all`, which never runs it, and another -e or -T does not stand in for it.
+    a build target rather than families or examples (a membrowse build-time script is
+    verified by examples-membrowse-upload) is a gap unless the run selected that target:
+    the default sweep builds `all`, which never runs it, and another -e or -T does not
+    stand in for it.
     `chosen` (-e or -T given) hands the rest to the caller, bar a family no board of which
     was built and bar that target: narrowing the examples does not change which families
     the scope resolves to. With no
@@ -575,7 +589,7 @@ def coverage(reasons, scope, results, chosen=False, targets=()):
     benign, gaps = [], []
     for r in reasons:
         fams, exs = named_families(r), named_examples(r)
-        if r.endswith('no build contribution') or r.endswith('no dep entry changed, no contribution'):
+        if r.endswith('no build contribution') or r.endswith('no build-family dependency changed, no contribution'):
             benign.append(r)
         elif r.endswith('no contribution') or r.endswith('dropped'):
             gaps.append(r)
@@ -639,7 +653,7 @@ def configured(board, family, examples, defines, build_dir, elfs, fresh):
 
 
 STICKY_OPTIONS = ('LOG', 'LOGGER', 'CFLAGS_CLI')   # family_support.cmake reads these with if(DEFINED)
-BUILD_PY_OPTIONS = ('BOARD', 'CMAKE_BUILD_TYPE', 'LINKERMAP_OPTION', 'TOOLCHAIN')
+BUILD_PY_OPTIONS = ('BOARD', 'CMAKE_BUILD_TYPE', 'TOOLCHAIN')
 CACHE_ENTRY = re.compile(r'^([A-Za-z_]\w*):([A-Z]+)=(.*)$')
 AGENT_DEFINES = '.agent-defines'
 
@@ -676,10 +690,11 @@ def stale_options(build_dir, supplied):
     retypes PICO_SDK_PATH to PATH - and the value then survives with nothing in the cache
     left to say a command line gave it. The entry type is the fallback for a dir configured
     before the sidecar existed: a -D no cmake code declares keeps UNINITIALIZED, the type
-    only a command line gives, and the four tools/build.py passes on every configure are
-    this run's own. A recorded name the cache no longer carries is no risk either - nothing
-    holds its value. An empty value is an option too: -DLOG= leaves a cache
-    entry, if(DEFINED LOG) is true for it, and the build compiles with CFG_TUSB_DEBUG=.
+    only a command line gives, and BUILD_PY_OPTIONS, which tools/build.py passes on
+    every configure, are this run's own. A recorded name the cache no longer carries is
+    no risk either - nothing holds its value. An empty value is an option too: -DLOG=
+    leaves a cache entry, if(DEFINED LOG) is true for it, and the build compiles with
+    CFG_TUSB_DEBUG=.
     An option this run does set is no risk: its -D overwrites the cached value.
     Espressif builds one idf tree per example under the dir, each with a cache full of
     idf.py's own untyped defines; -D is refused for that family (build_one), so there only
@@ -738,7 +753,7 @@ def build_one(board, examples, targets, defines, cflags, shared, fetch, verbose,
     owned = sorted({d.partition('=')[0].partition(':')[0] for d in defines} & set(BUILD_PY_OPTIONS))
     if owned:
         fail(f'-D {", ".join(owned)}: tools/build.py owns {"/".join(BUILD_PY_OPTIONS)}; name the board '
-             f'with --board and leave the build type, linker map and toolchain to it')
+             f'with --board and leave the build type and toolchain to it')
     ensure_deps(family, fetch, verbose)
     name = name or board
     if not shared:
@@ -778,7 +793,7 @@ def build_one(board, examples, targets, defines, cflags, shared, fetch, verbose,
     elif all(s == 'Skipped' for s in statuses):
         status, first = 'skipped', 'no example was built for this board (all rows Skipped)'
     elif 'Failed' in statuses or rc != 0:
-        status, first = 'failed', first_error(out) or rows[-1][1]
+        status, first = 'failed', tools_build.build_utils.first_error(out) or rows[-1][1]
     else:
         status, first = 'ok', ''
     # built counts only what this invocation wrote: a shared dir keeps older elfs. A
@@ -793,12 +808,6 @@ def build_one(board, examples, targets, defines, cflags, shared, fetch, verbose,
     return {'board': board, 'family': family, 'buildDir': build_dir, 'status': status,
             'built': len(fresh), 'okExamples': sorted({e.stem for e in verified}), 'firstError': first,
             'familyJson': catalog_line}
-
-
-def first_error(out):
-    lines = [l.strip() for l in out.splitlines()]
-    return next((l for l in lines if DIAGNOSTIC.search(l)), None) or \
-        next((l for l in lines if CMAKE_ERROR.match(l)), None)
 
 
 def run(cmd, verbose):
