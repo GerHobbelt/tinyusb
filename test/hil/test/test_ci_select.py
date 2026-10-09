@@ -671,6 +671,11 @@ class TestOpenocdVidPid(unittest.TestCase):
                 self.assertNotIn('vid_pid', f.get('args', ''),
                                  f"{path}: {board['name']} packs vid_pid into args; use the field")
 
+    def test_roster_pyocd_entries_filter_vid_pid(self):
+        # unfiltered, pyocd opens every CMSIS-DAP-class device on the rig (test/hil/pyocd/run_pyocd.py)
+        for path, board in roster_flashers():
+            self.assertFalse(hil_flash.unfiltered_pyocd(board), f"{path}: {board['name']}")
+
 
 class TestRosterFlashersDispatch(unittest.TestCase):
     """hil_test and hil_pool_check resolve a board's flasher through
@@ -913,10 +918,9 @@ class FlasherRecoverEntry(unittest.TestCase):
         after the same demonstration. frdm_k64f is host-only, so usbtest never marks
         it; its entry serves a manual reset through the recovery flasher. Left out, and why: stm32f769disco (probe not on the rig to demonstrate), ra4m1_ek (reset-only
         worked ~80% under openocd, SYSRESETREQ or srst, where JLinkExe resets 5/5; 2026-09-22).
-        mimxrt1064_evk and lpcxpresso55s28 are reset-only: openocd 0ce743125 has no target cfg and
-        no flash driver for them (FlexSPI, LPC55), so their entries declare a bare SWD DAP and
-        Cortex-M target with SYSRESETREQ; 3/3 resets each re-enumerated the DUT (2026-09-22);
-        lpcxpresso55s28 logs "DP initialisation failed" after each reset yet resets. Same trade as
+        mimxrt1064_evk is reset-only: openocd 0ce743125 has no target cfg and no flash driver for
+        it (FlexSPI), so its entry declares a bare SWD DAP and Cortex-M target with SYSRESETREQ;
+        3/3 resets each re-enumerated the DUT (2026-09-22). Same trade as
         nrf54lm20dk below. nrf54lm20dk's reset works (libjaylink 0.5.0 finds its PID 0x1069; 0.4.0 did
         not) but its reflash cannot: nrf54l.cfg declares no RRAM flash bank. Accepted trade:
         the entry arms in-run recovery (a reset) where JLinkExe allowed none; a wedge the reset
@@ -932,14 +936,12 @@ class FlasherRecoverEntry(unittest.TestCase):
         demonstrated = {'feather_nrf52840_express', 'metro_m4_express', 'stm32f072disco',
                         'stm32f407disco', 'stm32f723disco', 'stm32l476disco', 'lpcxpresso11u37',
                         'ea4088_quickstart', 'nrf54lm20dk', 'frdm_k64f', 'mimxrt1064_evk',
-                        'lpcxpresso55s28',
                         'lpcxpresso43s67'}   # hfp.json, demonstrated on tusb
-        reset_only = {name: ('-f interface/jlink.cfg -c "transport select swd" -c "adapter speed 1000" '
-                             f'-c "swd newdap {chip} cpu -expected-id 0" '
-                             f'-c "dap create {chip}.dap -chain-position {chip}.cpu" '
-                             f'-c "target create {chip}.cpu cortex_m -dap {chip}.dap" '
-                             '-c "cortex_m reset_config sysresetreq"')
-                      for name, chip in (('mimxrt1064_evk', 'rt1064'), ('lpcxpresso55s28', 'lpc55s28'))}
+        reset_only = {'mimxrt1064_evk': ('-f interface/jlink.cfg -c "transport select swd" -c "adapter speed 1000" '
+                                         '-c "swd newdap rt1064 cpu -expected-id 0" '
+                                         '-c "dap create rt1064.dap -chain-position rt1064.cpu" '
+                                         '-c "target create rt1064.cpu cortex_m -dap rt1064.dap" '
+                                         '-c "cortex_m reset_config sysresetreq"')}
         seen = set()
         for path, board in roster_flashers():
             if 'flasher_recover' not in board:
@@ -1249,17 +1251,20 @@ class TestTheHarnessTestsAreNotTheHarness(unittest.TestCase):
             'test/hil/test/test_ci_metrics.py',
             'test/hil/test/test_ci_select.py',
             'test/hil/test/test_code_size.py',
+            'test/hil/test/test_code_size_ci.py',
             'test/hil/test/test_drivers_coverage.py',
             'test/hil/test/test_family_json.py',
             'test/hil/test/test_hil_args.py',
             'test/hil/test/test_hil_bounded.py',
             'test/hil/test/test_hil_mtp_raw.py',
             'test/hil/test/test_hil_pool_check.py',
+            'test/hil/test/test_hil_pyocd.py',
             'test/hil/test/test_hil_remote.py',
             'test/hil/test/test_hil_report.py',
             'test/hil/test/test_hil_reset_order.py',
             'test/hil/test/test_hil_rtt.py',
             'test/hil/test/test_hil_usbtest_id.py',
+            'test/hil/test/test_hil_usbtest_tt.py',
             'test/hil/test/test_hil_usbtest_verdict.py',
             'test/hil/test/test_hil_util.py',
             'test/hil/test/test_membrowse_cli.py',
@@ -1873,7 +1878,7 @@ class TestBuildClassifier(unittest.TestCase):
                   '.clang-format', '.idea/misc.xml', 'version.yml', 'library.json',
                   'examples/CMakePresets.json', 'test/fuzz/fuzz.cc',
                   'test/unit-test/project.yml', '.github/workflows/pr_comment.yml',
-                  '.claude/skills/build-doc/scripts/gen_doc.py', '.agents'):
+                  '.github/scripts/code_size_ci.py', '.claude/skills/build-doc/scripts/gen_doc.py', '.agents'):
             s = self.b([p])
             self.assertFalse(s['full'], p)
             self.assertEqual(s['families'], [], p)
@@ -1991,9 +1996,8 @@ class TestNoContributionPaths(unittest.TestCase):
     whole build matrix plus an exclusive full-rig sweep - where master ran nothing."""
 
     def test_local_tooling_contributes_nothing_on_either_axis(self):
-        # no CI build and no rig board runs any of these (drivers_coverage_check.py is
-        # pre-commit only)
-        for p in ('tools/code_size.py', 'tools/drivers_coverage_check.py'):
+        # no CI build and no rig board runs it (pre-commit only)
+        for p in ('tools/drivers_coverage_check.py',):
             h = sel([p])
             self.assertFalse(h['full'], p)
             self.assertEqual(h['boards'], {}, p)
@@ -2009,13 +2013,14 @@ class TestNoContributionPaths(unittest.TestCase):
         self.assertEqual(h['boards'], {}, p)
         self.assertTrue(ci_select.classify_build([p], REPO)['full'], p)
 
-    def test_membrowse_cli_is_a_full_build_matrix_without_hil(self):
-        # run by family_add_membrowse() for every pinned board (rule 2d)
-        p = 'tools/membrowse_cli.py'
-        h = sel([p])
-        self.assertFalse(h['full'], p)
-        self.assertEqual(h['boards'], {}, p)
-        self.assertTrue(ci_select.classify_build([p], REPO)['full'], p)
+    def test_ci_size_scripts_are_a_full_build_matrix_without_hil(self):
+        # run by every pinned build leg (rule 2d): membrowse_cli.py from
+        # family_add_membrowse(), code_size.py as the CI size snapshot
+        for p in ('tools/membrowse_cli.py', 'tools/code_size.py'):
+            h = sel([p])
+            self.assertFalse(h['full'], p)
+            self.assertEqual(h['boards'], {}, p)
+            self.assertTrue(ci_select.classify_build([p], REPO)['full'], p)
 
     def test_typec_example_builds_but_runs_nothing(self):
         # examples/typec is compiled by the build matrix and run by no rig board; the
@@ -2304,6 +2309,25 @@ class TestHilCiSetMatrixExamples(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
+    def test_an_esp_idf_variant_must_name_itself(self):
+        # hil-build-esp sizes and uploads every leg under its --build-name: an unnamed
+        # esp-idf variant would collide with the plain board; other buckets never upload
+        import tempfile
+        other = {'name': 'metro_m4_express', 'uid': 'm', 'flasher': {'name': 'jlink'},
+                 'variant': [{'name': 'metro_m4_express', 'defines': ['MAX3421_HOST=1']}]}
+        for vname, ok in (('espressif_s3_devkitm', False), ('espressif_s3_devkitm-X', True)):
+            esp = {'name': 'espressif_s3_devkitm', 'uid': 'u', 'flasher': {'name': 'esptool'},
+                   'variant': [{'name': vname, 'defines': ['X=1']}]}
+            with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
+                json.dump({'boards': [esp, other]}, f)
+                f.flush()
+                r = subprocess.run([sys.executable, HIL_SET_MATRIX, f.name], capture_output=True, text=True)
+            self.assertEqual(r.returncode == 0, ok, r.stderr)
+            if ok:
+                self.assertEqual(json.loads(r.stdout)['arm-gcc'], ['-b metro_m4_express -DMAX3421_HOST=1'])
+            else:
+                self.assertIn('an esp-idf variant needs a name of its own', r.stderr)
+
     def test_no_hil_examples_is_byte_identical(self):
         plain = self.run_matrix()
         sel = json.dumps({'full': True, 'boards': {}})
@@ -2435,6 +2459,36 @@ class TestBuildPyExampleFilter(unittest.TestCase):
         # `membrowse_cli.py report`'s own elf-missing check takes the --identical branch
         self.assertEqual(cmd[cmd.index('--elf') + 1],
                          'cmake-build/cmake-build-espressif_s3_devkitc/device/cdc_msc_freertos/cdc_msc_freertos.elf')
+
+    def test_a_variant_is_a_membrowse_board_named_by_its_build_name(self):
+        from unittest import mock
+        calls = []
+        def fake_run(cmd):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0)
+        real_isdir = os.path.isdir
+        no_build_dir = lambda p: False if str(p).startswith('cmake-build/') else real_isdir(p)
+        with mock.patch.object(self.build, 'run_cmd', fake_run), \
+             mock.patch.object(self.build.os.path, 'isdir', no_build_dir):
+            self.build.cmake_board('espressif_s3_devkitc', [], 'espressif_s3_devkitc-DMA', ['-DX=1'], ['all'],
+                                   examples=['device/cdc_msc_freertos'])
+            self.build.cmake_board('espressif_s3_devkitc', [], 'espressif_s3_devkitc-DMA', [],
+                                   ['examples-membrowse-upload'], examples=['device/cdc_msc_freertos'])
+        idf, identical = calls
+        self.assertIn('-DMEMBROWSE_BOARD=espressif_s3_devkitc-DMA', idf)
+        self.assertIn('cmake-build/cmake-build-espressif_s3_devkitc-DMA/device/cdc_msc_freertos', idf)
+        self.assertEqual(identical[identical.index('--target-name') + 1], 'espressif_s3_devkitc-DMA/cdc_msc_freertos')
+
+    def test_an_unnamed_variant_never_uploads_under_the_plain_board(self):
+        from unittest import mock
+        for argv, refused in ((['-b', 'b1', '--cflag=-DX=1'], True), (['-b', 'b1', '-DX=1'], True),
+                              (['-b', 'b1', '--build-name', 'b1-X', '--cflag=-DX=1'], False), (['-b', 'b1'], False)):
+            with mock.patch.object(self.build, 'build_boards_list', return_value=[1, 0, 0]) as build, \
+                 mock.patch.object(sys, 'argv', ['build.py', '-T', 'examples-membrowse-upload'] + argv), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                ret = self.build.main()
+            self.assertEqual((ret, build.called), (1, False) if refused else (0, True), argv)
+            self.assertEqual('requires --build-name' in out.getvalue(), refused)
 
     def test_make_one_example_uses_make_semantics(self):
         # F1 end to end: the make path must ask skip_example with build_system='make',

@@ -62,7 +62,7 @@ from multiprocessing import TimeoutError as MpTimeoutError
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # PYTHONSAFEPATH drops it
 import hil_flash
 import usbtest    # the recovery bounds and the id registration; batteries run it as a subprocess
-from helper import hil_args, hil_lock, hil_report, hil_util
+from helper import hil_args, hil_lock, hil_report, hil_tt, hil_util
 from helper.hil_util import device_tests, dual_tests, host_test
 
 # Raw Lock/Semaphore objects in Pool initargs are inheritable only under fork
@@ -167,7 +167,7 @@ class FlasherCfg(TypedDict):
     name: str
     uid: str
     args: NotRequired[str]     # stlink entries carry no args
-    vid_pid: NotRequired[str]  # openocd probe pin, verbatim (e.g. "0x2e8a 0x000c")
+    vid_pid: NotRequired[str]  # openocd/pyocd probe filter, verbatim (e.g. "0x2e8a 0x000c")
     verify: NotRequired[bool]  # openocd read-back verify opt-out (WCH)
 
 
@@ -1658,6 +1658,29 @@ def _usbtest_verdict(board: Board, data: dict, out: str, passed: int, failed: in
 # -------------------------------------------------------------
 
 
+_dut_port: dict = {}   # board uid -> (busport, speed) last seen: a stuck port stops enumerating
+
+
+def reset_dut_tt(board: Board) -> bool:
+    """Reset the TT of the board's hub port before a flash (helper/hil_tt): a leaked TT
+    buffer from the previous test would otherwise fail this one's enumeration. False when
+    hil_tt.reset_tt could not confirm the reset."""
+    found = hil_util.usb_scan(vid='cafe', serial=board['uid'])
+    if len(found) > 1:
+        return True  # one serial on two ports (dual-port parts mid-reflash): no safe target
+    if found:
+        busport = found[0]['busport']
+        speed = hil_util.read_sysfs(os.path.join('/sys/bus/usb/devices', busport, 'speed'))
+        last = _dut_port.get(board['uid'])
+        if speed is None and last and last[0] == busport:
+            speed = last[1]  # unreadable mid-re-enumeration: keep the speed last seen there
+        _dut_port[board['uid']] = (busport, speed)
+    if board['uid'] in _dut_port:
+        # a gone device keeps the speed it was seen at: a high-speed one has no TT to reset
+        return hil_tt.reset_tt(*_dut_port[board['uid']])
+    return True
+
+
 def test_example(board: Board, variant: str, example: str) -> tuple[int, str, str | None]:
     """
     Test example firmware
@@ -1715,6 +1738,11 @@ def test_example(board: Board, variant: str, example: str) -> tuple[int, str, st
         with redirect_stdout(attempt_out):
             if not skip_flash:
                 with hil_lock.flash_permit(board['uid']):
+                    if not reset_dut_tt(board):
+                        # flash anyway: the hub stays unconfirmed for the rest of the run, so
+                        # refusing would fail every later test on it; a late Reset_TT from
+                        # the timed-out helper can still disturb this attempt, so name it
+                        print('Reset_TT unconfirmed before flash', flush=True)
                     t_flash = time.monotonic()
                     try:
                         ret = hil_flash.flash_primitive(board['flasher']['name'])(board, str(fw_name))
@@ -2314,6 +2342,10 @@ def main() -> None:
     if bad_rtt:
         # JlinkRtt speaks JLinkExe only (the OpenOCD RTT route is manual — rtt skill)
         _config_abort(f'"logger": "rtt" needs a jlink flasher: {", ".join(bad_rtt)}')
+    bad_pyocd = [e['name'] for e in config_boards if hil_flash.unfiltered_pyocd(e)]
+    if bad_pyocd:
+        _config_abort(f'a pyocd flasher needs a uid and one "vid_pid" pair (e.g. "0x1fc9 0x0090"): '
+                      f'{", ".join(bad_pyocd)}')
     rtt_no_logger_def = [e['name'] for e in config_boards
                          if e.get('logger') == 'rtt'
                          and any('LOGGER=rtt' not in v['defines'] for v in hil_report.board_variants(e))]
