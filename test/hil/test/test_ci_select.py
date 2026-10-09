@@ -30,6 +30,12 @@ import ci_select
 from helper.hil_util import device_tests, dual_tests
 
 
+def _read(path):
+    # Fixed encoding, like ci_select._read: a non-UTF-8 locale would fail on tracked non-ASCII bytes.
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
 def real_rosters():
     """The actual rig rosters, for regression tests that need real-world data
     (a specific board/family/only-list) rather than the synthetic ROSTER above."""
@@ -850,7 +856,7 @@ class TestRostersDoNotOverlap(unittest.TestCase):
     def test_no_board_name_is_in_two_rosters(self):
         seen = {}
         for name in ('tinyusb.json', 'hfp.json'):
-            cfg = json.load(open(os.path.join(REPO, 'test/hil', name)))
+            cfg = json.loads(_read(os.path.join(REPO, 'test/hil', name)))
             for b in cfg['boards']:
                 if b['name'] in seen:
                     self.assertEqual(
@@ -1143,8 +1149,7 @@ class TestRuleTableIsCarbonOfTheSpec(unittest.TestCase):
         return out
 
     def test_docstring_table_matches_the_spec(self):
-        spec = open(os.path.join(
-            REPO, 'docs/superpowers/specs/2026-08-19-ci-build-family-filter-design.md')).read()
+        spec = _read(os.path.join(REPO, 'docs/superpowers/specs/2026-08-19-ci-build-family-filter-design.md'))
         doc, spec_rows = self._rows(ci_select.__doc__), self._rows(spec)
         self.assertTrue(spec_rows, 'no rule table found in the spec')
         self.assertEqual([r[0] for r in doc], [r[0] for r in spec_rows],
@@ -1154,7 +1159,7 @@ class TestRuleTableIsCarbonOfTheSpec(unittest.TestCase):
 
     def test_every_documented_rule_has_a_branch(self):
         import re as _re
-        src = open(os.path.join(REPO, 'tools/ci_select.py')).read()
+        src = _read(os.path.join(REPO, 'tools/ci_select.py'))
         marked = set()
         # handles `# rule 6`, `# rules 1, 1b` and `# rules 8-10`
         for m in _re.finditer(r'#\s*rules?\s+([0-9a-z, -]+)', src):
@@ -1676,8 +1681,8 @@ class TestBuildPostFilter(unittest.TestCase):
     def test_espressif_prunes_to_what_its_build_path_can_build(self):
         # build.py's espressif branch builds get_examples('espressif') only (the
         # *_freertos examples plus a short extra list), so keeping espressif for a
-        # device/mtp diff spins CircleCI's most expensive leg up to skip everything
-        s = ci_select.classify_build(['examples/device/mtp/src/main.c'], REPO)
+        # device/cdc_msc diff spins CircleCI's most expensive leg up to skip everything
+        s = ci_select.classify_build(['examples/device/cdc_msc/src/main.c'], REPO)
         self.assertFalse(s['full'])
         self.assertNotIn('espressif', s['families'])
 
@@ -2156,7 +2161,11 @@ class TestBuildPyExampleFilter(unittest.TestCase):
             calls.append(cmd)
             return types.SimpleNamespace(returncode=0)
 
-        with mock.patch.object(self.build, 'run_cmd', fake_run):
+        # the checkout may hold a real cmake-build/cmake-build-espressif_s3_devkitc from HIL work
+        real_isdir = os.path.isdir
+        no_build_dir = lambda p: False if str(p).startswith('cmake-build/') else real_isdir(p)
+        with mock.patch.object(self.build, 'run_cmd', fake_run), \
+             mock.patch.object(self.build.os.path, 'isdir', no_build_dir):
             r = self.build.cmake_board('espressif_s3_devkitc', [], None, [],
                                        ['examples-membrowse-upload'],
                                        examples=['device/cdc_msc_freertos'])
@@ -2168,9 +2177,10 @@ class TestBuildPyExampleFilter(unittest.TestCase):
         self.assertIn('--upload', cmd)
         self.assertEqual(cmd[cmd.index('--target-name') + 1],
                          'espressif_s3_devkitc/cdc_msc_freertos')
-        # the whole point: the --elf path must NOT exist, so membrowse_report.py's
-        # own elf-missing check takes the --identical branch
-        self.assertFalse(os.path.isfile(cmd[cmd.index('--elf') + 1]))
+        # the whole point: --elf names the file the (absent) build dir would hold, so
+        # membrowse_report.py's own elf-missing check takes the --identical branch
+        self.assertEqual(cmd[cmd.index('--elf') + 1],
+                         'cmake-build/cmake-build-espressif_s3_devkitc/device/cdc_msc_freertos/cdc_msc_freertos.elf')
 
     def test_make_one_example_uses_make_semantics(self):
         # F1 end to end: the make path must ask skip_example with build_system='make',
@@ -2326,7 +2336,7 @@ class TestFamilyMcusFallback(unittest.TestCase):
         out = []
         for fc in sorted(glob.glob(os.path.join(REPO, 'hw/bsp/*/family.cmake'))):
             depth, uncond = 0, False
-            for line in open(fc).read().splitlines():
+            for line in _read(fc).splitlines():
                 line = line.strip()
                 if build_utils._FAMILY_MCUS_RE.match(line) and depth == 0:
                     uncond = True
@@ -2409,7 +2419,7 @@ class TestMcuTokensResolve(unittest.TestCase):
         wanted = {ns: set() for ns in self.UNREACHABLE_TOKENS}
         for f in glob.glob(os.path.join(REPO, 'examples/*/*/*.txt')):
             if os.path.basename(f) in ('skip.txt', 'only.txt'):
-                for tok in open(f).read().split():
+                for tok in _read(f).split():
                     ns, _, name = tok.partition(':')
                     if ns in wanted and name:
                         wanted[ns].add(name)
@@ -2433,7 +2443,7 @@ class TestMcuTokensResolve(unittest.TestCase):
     def test_the_mcx_skip_tokens_are_still_live(self):
         # the reason the mcx scrape is load-bearing rather than academic
         named = [os.path.dirname(f) for f in glob.glob(os.path.join(REPO, 'examples/*/*/skip.txt'))
-                 if 'mcu:MCXA15' in open(f).read().split()]
+                 if 'mcu:MCXA15' in _read(f).split()]
         self.assertTrue(named, 'no skip.txt names mcu:MCXA15 any more')
 
 
