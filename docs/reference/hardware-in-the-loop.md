@@ -256,9 +256,10 @@ Why the rule matters:
   puts a second hub's whole subtree behind one of those uplinks, and the `usbtest`
   battery saturates whatever it is given.
 - **Blast radius.** A board that wedges its hub costs seven ports, not the rig.
-- **Scheduling.** `hil_test.py` budgets flashing and `usbtest` concurrency per host
-  controller (`test/hil/helper/hil_lock.py`: `FLASH_PARALLEL`, `USBTEST_PARALLEL`), which
-  only means anything when a controller's set of devices is fixed.
+- **Scheduling.** `hil_test.py` dispatches boards round-robin across host controllers
+  (`schedule_boards` in `test/hil/hil_test.py`), which
+  only means anything when a controller's set of devices is fixed. It orders starts only;
+  boards in flight are bounded by the worker pool (`cpu_count`), not per controller.
 
 Bus numbers are *not* stable across reboots or recabling, so nothing in the harness
 addresses a board by bus path. Boards are identified by the MCU's unique ID and probes by
@@ -281,7 +282,7 @@ Both files are the source of truth — this table is generated from them.
    `test/hil/hil_test.py`, which flashes each board and runs its tests. Espressif boards
    run in `hil-tinyusb-esp`, gated on the slower ESP-IDF build, and `hil-hfp-iar` builds
    with IAR inside the job.
-3. On pull requests, `tools/ci_select.py` narrows the run to the boards a diff can
+3. On pull requests, `tools/change_impact.py` narrows the run to the boards a diff can
    affect — and each board's build to the examples its tests need — falling open to the
    full matrix when it cannot tell. The same pass scopes the build matrix.
 4. Each board is arbitrated by a kernel flock in `/tmp/tinyusb-hil-locks/`, so interactive

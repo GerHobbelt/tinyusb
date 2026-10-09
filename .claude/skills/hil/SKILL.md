@@ -38,7 +38,7 @@ python3 test/hil/helper/hil_lock.py release BOARD [BOARD...]
 - Never pre-hold boards you are about to run `hil_test.py` on — it self-locks and would treat your own hold as a conflict.
 - Rig-wide operations (uhubctl power cycling, `usb_recover.sh root-cycle`, pci-rebind, controller resets — bus renumbering) affect every board: `hil_lock.py hold --all --config <this host's config> --reason "..."` first — `--all` defaults to `tinyusb.json`, so on `tusb` it would reserve 27 boards that do not exist there and none of the three that do. Even a single root-port bounce needs `--all`: nothing maps a sysfs busport to a board name, and `hil_lock.py hold` accepts any string, so a "just the siblings" hold reserves nothing while reporting success. If `--all` cannot be taken, wait: a partial hold is worse than none, because it reads as protection.
 - `hil_lock.py status` lists holders. Locks auto-release when the holder process dies (kernel flock); `/tmp` clears on reboot.
-- A board whose usbtest battery reported the device wedged (a HUNG case the in-run recovery could not clear, or a device it could no longer identify afterwards) gets a `board-wedged` cell and the rest of its examples are skipped for that run. No admission marker blocks the next run; the harness tries to flash the board again. Interactively, follow `usb-kernel-recover` from its triage before running it again; a delegated run follows Reporting.
+- A board whose usbtest battery reported the device wedged (a HUNG case the in-run recovery could not clear, or a device it could no longer identify afterwards) gets a `board-wedged` cell and the rest of its examples are skipped for that run. No admission marker blocks the next run. Before a board's first flash, a run without `--skip-flash` looks for a D-state `testusb` on that board's usbfs node, which a cancelled or killed run leaves behind, and resets the board through its convoy-safe recovery flasher (`flasher_recover`, else `flasher`); a board it cannot free is reported `board-wedged` without being flashed. A stray on a board outside the run is not swept. Interactively, follow `usb-kernel-recover` from its triage before running it again; a delegated run follows Reporting.
 - Forcing past a lock: `HIL_NO_BOARD_LOCK=1 python3 test/hil/hil_test.py ...` bypasses the guard without killing the holder. Only when the request or task scope explicitly names forcing that board — it risks colliding with whatever holds it; a refused hold alone never adds that scope.
 
 ## Pool check (board/probe health)
@@ -48,11 +48,11 @@ Use it before a HIL campaign, after rig maintenance/reboot, or when boards fail 
 
 ## PR-scoped selection
 
-`tools/ci_select.py` maps a diff to affected boards/tests (used by CI on PRs; fail-open
+`tools/change_impact.py` maps a diff to affected boards/tests (used by CI on PRs; fail-open
 to the full matrix). Manual use:
 
 ```bash
-SEL=$(python3 tools/ci_select.py --base master test/hil/tinyusb.json)
+SEL=$(python3 tools/change_impact.py --base master test/hil/tinyusb.json)
 FULL=$(printf '%s' "$SEL" | python3 -c "import json,sys; print(json.load(sys.stdin)['full'])")
 ARGS=$(printf '%s' "$SEL" | python3 -c "import json,sys; print(json.load(sys.stdin)['args']['tinyusb.json'])")
 if [ "$FULL" = "True" ] || [ -n "$ARGS" ]; then
@@ -66,8 +66,8 @@ Read `full`, never `args` alone: `args` is empty for BOTH `full: true` (run the 
 unclassified change) and "nothing selected" (skip). Skip only when `full` is false AND `args` is empty.
 
 Unit suites (no hardware) live in `test/hil/test/test_*.py`; the `hil-test` pre-commit hook
-runs every `test_hil*.py`, `ci-select-test` the two `test_ci_*` suites plus
-`test_hil_util.BottomLayer`. `test_ci_select.py` covers only selection, `test_ci_metrics.py`
+runs every `test_hil*.py`, `change-impact-test` `test_change_impact.py`, `test_ci_metrics.py` and
+`test_hil_util.BottomLayer`. `test_change_impact.py` covers only selection, `test_ci_metrics.py`
 only the code-size plumbing; the bounded reads and the build and pool guards live in
 `test_hil_bounded.py` and `test_hil_util.py`; `test_hil_report.py` covers the report document, `test_hil_rtt.py`
 the RTT console and `test_hil_pool_check.py` the pool check's verdicts and output. Run them all when changing `test/hil`:
@@ -92,7 +92,7 @@ A board whose flasher probe has no VCOM (or whose BSP has no UART) uses RTT as i
 
 ## Arguments
 
-- **Board:** `-b BOARD_NAME`, repeatable for a subset (`-b a -b b`); omit to run all boards in the config. Give a whole set to ONE run rather than one run per board: it schedules the boards across host controllers and budgets concurrent flashes and usbtest batteries per controller (`hil_lock.py` `FLASH_PARALLEL`/`USBTEST_PARALLEL`). Those permits are in-process semaphores — a second `hil_test.py` running alongside does not share them, it multiplies the load on the same xHCI cards. (A dead uPD720201 card is not a width problem: every observed death traced to a marginal DUT port bouncing under concurrent batteries, and lowering the widths does not fix a bad port — fix the port or pull the board; the concurrency note above `FLASH_PARALLEL` in `hil_lock.py` keeps the record.)
+- **Board:** `-b BOARD_NAME`, repeatable for a subset (`-b a -b b`); omit to run all boards in the config. Give a whole set to ONE run rather than one run per board: it spreads the boards across host controllers in dispatch order, while a second `hil_test.py` running alongside multiplies the load on the same xHCI cards. (A marginal DUT port bouncing under concurrent batteries has killed a uPD720201: fix the port or pull the board.)
 - **Pass-through:** `-v`, `-r N`, etc. forwarded unchanged.
 
 If `local.json` is missing on a dev PC, ask the user to supply one before a `hil_test.py` or `hil_pool_check.py` run. An agent that cannot ask (`hil-operator`) does not run `hil_test.py`: it returns one `ran: false` row per requested board whose `detail` names the missing `test/hil/local.json`. Fall back to `tinyusb.json` only when the request or task scope says so; a manual session locks by board name as Board locks says.

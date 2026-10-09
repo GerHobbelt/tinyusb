@@ -59,6 +59,7 @@ def run_cmd(cmd):
 
 
 CI_PINNED_BOARDS = '.github/ci-pinned-boards.json'
+DEFAULT_TOOLCHAIN = 'gcc'
 
 
 def find_family(board):
@@ -161,6 +162,13 @@ def identical_uploads(board, build_name, examples):
     return ret
 
 
+def cmake_configure_cmd(board, build_dir, build_args, src='examples'):
+    """The argv configuring `board`'s examples in `src` into `build_dir`; code_size.py
+    configures through it too, so its local sizes are of the build CI makes."""
+    return ['cmake', src, '-B', build_dir, '-GNinja', f'-DBOARD={board}', '-DCMAKE_BUILD_TYPE=MinSizeRel',
+            *build_args]
+
+
 def cmake_board(board, build_args, build_name, build_cflags, build_targets, examples=None, defines=()):
     ret = [0, 0, 0]
     start_time = time.monotonic()
@@ -228,9 +236,7 @@ def cmake_board(board, build_args, build_name, build_cflags, build_targets, exam
                 print_build_result(board, 'examples (PR filter)', 2, '-')
                 return [0, 0, 1]
         existed = [build_dir] if os.path.isdir(build_dir) else []
-        rcmd = run_cmd(['cmake', 'examples', '-B', build_dir, '-GNinja',
-                        f'-DBOARD={board}', '-DCMAKE_BUILD_TYPE=MinSizeRel',
-                        *build_args, *build_flags])
+        rcmd = run_cmd(cmake_configure_cmd(board, build_dir, [*build_args, *build_flags]))
         if rcmd.returncode == 0 and canonical:
             print(canonical_row(family, [build_dir], existed), file=sys.stderr)
         if rcmd.returncode == 0 and configure_only:
@@ -384,7 +390,7 @@ def get_family_boards(family, one_random, one_first, examples=None, build_system
         one_first: If True, return only the first board (alphabetical)
         examples: PR example filter (-e). The one-board pick then prefers a board that
             can build at least one of them: the family is in the matrix BECAUSE some
-            board of it builds these examples (ci_select._prune_buildable asks about
+            board of it builds these examples (change_impact._prune_buildable asks about
             every board, since CircleCI builds every board), but GHA builds one. Without
             this, lpc54 selected for host/msc_file_explorer picks lpcxpresso54114 -
             which every one of those examples skips - and the leg runs to green having
@@ -455,7 +461,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('families', nargs='*', default=[], help='Families to build')
     parser.add_argument('-b', '--board', action='append', default=[], help='Boards to build')
-    parser.add_argument('-t', '--toolchain', default='gcc', help='Toolchain to use, default is gcc')
+    parser.add_argument('-t', '--toolchain', default=DEFAULT_TOOLCHAIN, help=f'Toolchain to use, default is {DEFAULT_TOOLCHAIN}')
     parser.add_argument('-s', '--build-system', default='cmake', help='Build system to use, default is cmake')
     parser.add_argument('-D', '--define-symbol', action='append', default=[], help='Define to pass to build system')
     parser.add_argument('--build-name', default=None,
@@ -521,7 +527,7 @@ def main():
             parser.error(f"-e/--example takes 'role/name' (e.g. device/cdc_msc), got '{e}'")
         # a name no example dir answers to would silently build nothing on every board
         # and still exit 0 (every row is a Skipped, and main() returns the FAILED count).
-        # The -e lists are generated - from ci_select's example map and from HIL roster
+        # The -e lists are generated - from change_impact's example map and from HIL roster
         # test names - so a stale one must be loud, not green
         if not os.path.isdir(os.path.join('examples', e)):
             parser.error(f"-e/--example '{e}': no such example directory examples/{e}")
