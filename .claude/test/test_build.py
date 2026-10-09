@@ -62,7 +62,7 @@ class ResolveTest(unittest.TestCase):
         return rc, json.loads(out.write.call_args_list[0][0][0]), b1
 
     def test_a_scope_of_only_non_code_paths_passes_with_nothing_to_build(self):
-        rc, printed, b1 = self._main_scope(['docs/index.rst', '.claude/agents/builder.md'])
+        rc, printed, b1 = self._main_scope(['docs/index.rst', '.claude/skills/build/SKILL.md'])
         b1.assert_not_called()
         self.assertEqual((rc, printed['pass'], printed['boards'], printed['uncovered']), (0, True, [], []))
         self.assertTrue(all('non-code' in r for r in printed['nothingToBuild']), printed)
@@ -220,7 +220,7 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(build.boards_for(sel, files)[0], ['stm32f411blackpill'])
 
     def test_expansion_includes_a_new_untracked_file(self):
-        # fanout verifies uncommitted work: a new board or driver file is untracked
+        # scope verification covers uncommitted work: a new board or driver file is untracked
         d = build.ROOT / 'hw' / 'bsp' / 'stm32f4' / 'boards' / 'stm32f411blackpill'
         new = d / 'probe_new_file.h'
         new.write_text('')

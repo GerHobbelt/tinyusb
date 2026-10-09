@@ -173,7 +173,7 @@ class RunAlongsideKeepsStderrOffThePayload(unittest.TestCase):
     it wrote. Merging stderr into that stream turns any stray child stderr byte -- a
     PYTHONWARNINGS chirp, a sitecustomize print, a venv .pth deprecation -- into
     'CDC->Printer wrong data', sending a maintainer after the printer class driver for an
-    interpreter warning. hil_ci.sh runs python3 with no isolating flags."""
+    interpreter warning. hil_remote.py runs python3 with no isolating flags."""
 
     def test_child_stderr_does_not_contaminate_stdout(self):
         from helper import hil_util
@@ -347,10 +347,10 @@ class BoundedReadForGuardlessCallers(unittest.TestCase):
         self.assertTrue(self.hil_util.sysfs_stranded(), 'the process-wide flag is sticky')
 
     def test_a_refused_read_is_stranded_not_vouched_for(self):
-        """usbtest fails CLOSED on path_stranded() before running remove_id/unbind, which
-        take the uninterruptible device_lock. Past _STRAND_MAX read_sysfs answers None
-        WITHOUT looking -- so answering False there hands that guard a fabricated
-        all-clear for a device nobody read, and the lock-taking cleanup runs on a wedge."""
+        """usbtest fails CLOSED on path_stranded() before reporting a board absent rather than
+        wedged. Past _STRAND_MAX read_sysfs answers None WITHOUT looking -- so answering
+        False there hands that guard a fabricated all-clear for a device nobody read, and a
+        wedged board is reported as merely unplugged."""
         self.hil_util._stranded.update(
             {f'/sys/fake/{i}': i for i in range(self.hil_util._STRAND_MAX)})
         self.assertIsNone(self.hil_util.read_sysfs(self.fifo, timeout=0.3))

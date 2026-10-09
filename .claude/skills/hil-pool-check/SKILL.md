@@ -12,8 +12,7 @@ applies safe per-device recovery (probe authorized-toggle, board reset), re-park
 `board_test`, and prints a summary table plus a USB topology report. Flags and details: `--help`
 and the module docstring.
 
-**REQUIRED BACKGROUND:** the `hil` skill owns config-by-hostname selection (run `hostname`
-first) and the board-lock protocol. Locked boards are reported 🔒 locked and skipped — never
+Read the `hil` skill first: it owns config selection by hostname and the board-lock protocol. Locked boards are reported 🔒 locked and skipped — never
 waited on, never bypassed; a needed build peeks the lock first. A CI worker reaching a board the
 pool check holds fails it as "board locked" — prefer running between CI runs.
 
@@ -75,15 +74,13 @@ own list — `STM32_Programmer_CLI -l st-link`, or `JLinkExe -CommandFile <scrip
 kernel and not the tool, which is a host-to-probe fault. A dead target reports the opposite: the
 probe identifies itself normally and then fails to connect.
 
-The next rung is a root-port bounce, and what it buys depends on which card the probe hangs off
-(`readlink -f /sys/bus/usb/devices/usb<bus>` gives the PCI address):
-
-- **Renesas** (five cards here): `uhubctl` lists their root hubs as `ppps`-capable, but the cards
-  do not implement it — VBUS never drops, only D+/D− (see usb-kernel-recover). A cycle is therefore
-  a harder forced re-enumeration, **not** a power cycle: worth one attempt, but a probe that rode
-  out the `authorized` toggle can ride this out too. Do not read `ppps` here as power control.
-- **AMD `0000:02:00.0`** (where the WCH-Links live): no port-power switching at all — `uhubctl`
-  does not list it. There is nothing to cycle; go straight to a physical replug.
+The next rung is a root-port bounce. Every probe hangs off one of the eight Renesas uPD720201
+controllers (`readlink -f /sys/bus/usb/devices/usb<bus>` gives the PCI address): `uhubctl` lists
+their root hubs as `ppps`-capable, but the cards do not implement it — VBUS never drops, only
+D+/D− (see usb-kernel-recover; measured on the `05`–`08` card, assumed for `01`–`04`). A cycle is
+therefore a harder forced re-enumeration, **not** a power cycle: worth one attempt, but a probe
+that rode out the `authorized` toggle can ride this out too. Do not read `ppps` here as power
+control; past that, only a physical replug is left.
 
 The leaf hubs are ganged, so a bounce hits every device under that root port. Escalate by hand, in
 this order:
@@ -99,7 +96,7 @@ this order:
    hits every board under the root port and nothing maps a sysfs busport to a board name, so
    `--all` is the only reservation that actually covers them:
    ```bash
-   python3 test/hil/helper/hil_lock.py hold --all --config test/hil/tinyusb.json --reason "probe power cycle"
+   python3 test/hil/helper/hil_lock.py hold --all --config <this host's config> --reason "probe power cycle"
    ```
    It is all-or-nothing: a refusal naming `hil_test.py` means a CI job is mid-test — wait, do
    not force, and do not substitute a partial hold. Release before step 5: `hil_pool_check.py`
