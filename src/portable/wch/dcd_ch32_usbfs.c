@@ -101,7 +101,6 @@
   static inline void ep_rx_set_response(uint8_t ep, uint8_t res) {
     EP_CTRL(ep) = (uint8_t) ((EP_CTRL(ep) & ~USBFS_EPC_R_RES_MASK) | ((res & USBFS_EP_R_RES_MASK) << USBFS_EPC_R_RES_SHIFT));
   }
-  #define EP0_SETUP_RX_TOG USBFS_EP_R_TOG // combined IP: data/status stage after SETUP is DATA1
 #else
   static inline void ep_tx_ctrl_set(uint8_t ep, uint8_t v) { EP_TX_CTRL(ep) = v; }
   static inline void ep_rx_ctrl_set(uint8_t ep, uint8_t v) { EP_RX_CTRL(ep) = v; }
@@ -111,19 +110,13 @@
   static inline void ep_rx_set_response(uint8_t ep, uint8_t res) {
     EP_RX_CTRL(ep) = (uint8_t) ((EP_RX_CTRL(ep) & ~USBFS_EP_R_RES_MASK) | res);
   }
-  #define EP0_SETUP_RX_TOG 0
 #endif
 
 // Hardware auto data-toggle flag. Parts whose AUTO_TOG is reliable OR it into the EP setup so the
-// controller flips DATA0/DATA1 itself; CH58x (CH32_USBFS_EP_MANUAL_TOG) leaves it clear and the
+// controller flips DATA0/DATA1 itself; CH58x (CH32_USBFS_EP4_MANUAL_TOG) leaves it clear and the
 // ISR flips the toggle bit after each packet instead.
-#ifdef CH32_USBFS_EP_MANUAL_TOG
-  #define EP_T_AUTO_TOG 0
-  #define EP_R_AUTO_TOG 0
-#else
-  #define EP_T_AUTO_TOG USBFS_EP_T_AUTO_TOG
-  #define EP_R_AUTO_TOG USBFS_EP_R_AUTO_TOG
-#endif
+#define EP_T_AUTO_TOG USBFS_EP_T_AUTO_TOG
+#define EP_R_AUTO_TOG USBFS_EP_R_AUTO_TOG
 
 /* private data */
 struct usb_xfer {
@@ -136,6 +129,7 @@ struct usb_xfer {
 
 static struct {
   bool            ep0_tog;
+  uint8_t         ep0_status_dir;
   bool            isochronous[EP_MAX][2]; // per [ep][dir]: an ep number may be iso in one direction
   struct usb_xfer xfer[EP_MAX][2];
 #ifdef CH32_USBFS_EP4_SHARES_EP0
@@ -206,30 +200,22 @@ static inline bool ep_shares_ep0_dma(uint8_t ep) {
 #else
 static inline uint8_t* ep_buffer(uint8_t ep, uint8_t dir) {
   #if CFG_TUD_WCH_USBFS_EP3_BUFSIZE > 64
+  if (ep == 3) { return dir == TUSB_DIR_IN ? data.ep3_buffer.in : data.ep3_buffer.out; }
   if (ep > 3) { return data.buffer[ep - 1][dir]; }
   #endif
   return data.buffer[ep][dir];
 }
 
 static inline uint32_t ep_dma_addr(uint8_t ep) {
-  #if CFG_TUD_WCH_USBFS_EP3_BUFSIZE > 64
-  if (ep == 3) { return (uint32_t) &data.ep3_buffer.out[0]; }
-  #endif
   return (uint32_t) ep_buffer(ep, TUSB_DIR_OUT);
 }
 
 static inline uint8_t* ep_out_buf(uint8_t ep) {
-  #if CFG_TUD_WCH_USBFS_EP3_BUFSIZE > 64
-  if (ep == 3) { return data.ep3_buffer.out; }
-  #endif
   return ep_buffer(ep, TUSB_DIR_OUT);
 }
 
 static inline uint8_t* ep_in_buf(uint8_t ep) {
   if (ep == 0) { return ep_buffer(0, TUSB_DIR_OUT); } // EP0 half-duplex: IN reuses OUT chunk
-  #if CFG_TUD_WCH_USBFS_EP3_BUFSIZE > 64
-  if (ep == 3) { return data.ep3_buffer.in; }
-  #endif
   return ep_buffer(ep, TUSB_DIR_IN);
 }
 
@@ -258,7 +244,6 @@ static void update_in(uint8_t rhport, uint8_t ep, bool force) {
       EP_TX_LEN(ep) = len;
       if (ep == 0) {
         ep_tx_ctrl_set(0, USBFS_EP_T_RES_ACK | (data.ep0_tog ? USBFS_EP_T_TOG : 0));
-        data.ep0_tog  = !data.ep0_tog;
       } else if (data.isochronous[ep][TUSB_DIR_IN]) {
         ep_tx_set_response(ep, USBFS_EP_T_RES_NYET);
       } else {
@@ -294,7 +279,7 @@ static void update_out(uint8_t rhport, uint8_t ep, size_t rx_len) {
     }
 
     if (ep == 0) {
-      ep_rx_set_response(0, USBFS_EP_R_RES_NAK);
+      ep_rx_ctrl_set(0, USBFS_EP_R_RES_NAK | (data.ep0_tog ? USBFS_EP_R_TOG : 0));
     } else {
       uint8_t rx_res =
         data.isochronous[ep][TUSB_DIR_OUT] ? USBFS_EP_R_RES_NYET : (xfer->valid ? USBFS_EP_R_RES_ACK : USBFS_EP_R_RES_NAK);
@@ -358,35 +343,33 @@ void dcd_int_handler(uint8_t rhport) {
 
     switch (token) {
       case PID_OUT: {
-        // Drop an OUT packet whose data toggle doesn't match what we expect -- a host retransmit
-        // after a lost ACK, or a host that doesn't alternate DATA0/DATA1. The hardware auto-toggle
-        // does not reject these on its own, so the check is needed on every variant. EP0 keeps its
-        // own toggle via the SETUP/status flow and is exempt; isochronous is DATA0-only (no toggle),
-        // so its packets must not be toggle-checked.
-        if (ep != 0 && !data.isochronous[ep][TUSB_DIR_OUT] && !(int_st & USBFS_INT_ST_TOG_OK)) { break; }
-#ifdef CH32_USBFS_EP_MANUAL_TOG
-        // CH58x has no hardware auto-toggle: advance the expected RX toggle after each accepted packet
-        // (EP0 included -- it also has no auto-toggle and a control-OUT data stage can span packets).
-        // Iso endpoints are DATA0-only, so leave them alone (matches the PID_IN path).
-        if (!data.isochronous[ep][TUSB_DIR_OUT]) { EP_CTRL(ep) ^= USBFS_EPC_R_TOG; }
+        // A lost ACK makes the host retry the previous DATA PID. Drop the duplicate before it
+        // reaches the transfer state and before advancing the expected toggle. EP0 owns its
+        // toggle in ep0_tog on every variant; isochronous endpoints are DATA0-only (no toggle).
+        if (!data.isochronous[ep][TUSB_DIR_OUT] && !(int_st & USBFS_INT_ST_TOG_OK)) { break; }
+        if (ep == 0) { data.ep0_tog = !data.ep0_tog; }
+#ifdef CH32_USBFS_EP4_MANUAL_TOG
+        // Advance the expected EP4 RX toggle after each accepted packet. Iso endpoints are DATA0-only,
+        if (ep == 4 && !data.isochronous[ep][TUSB_DIR_OUT]) { EP_CTRL(ep) ^= USBFS_EPC_R_TOG; }
 #endif
         update_out(rhport, ep, rx_len);
         break;
       }
 
       case PID_IN:
-#ifdef CH32_USBFS_EP_MANUAL_TOG
-        // Manual toggle: flip the TX toggle after each ACK'd IN packet (EP0 manages its own).
+        if (ep == 0) { data.ep0_tog = !data.ep0_tog; }
+#ifdef CH32_USBFS_EP4_MANUAL_TOG
+        // Manual toggle: flip the TX toggle after each ACK'd IN packet for EP4.
         // Isochronous transfers are DATA0-only (no toggle), so leave iso endpoints alone.
-        if (ep != 0 && !data.isochronous[ep][TUSB_DIR_IN]) { EP_CTRL(ep) ^= USBFS_EPC_T_TOG; }
+        if (ep == 4 && !data.isochronous[ep][TUSB_DIR_IN]) { EP_CTRL(ep) ^= USBFS_EPC_T_TOG; }
 #endif
         update_in(rhport, ep, false);
         break;
 
       case PID_SETUP:
         // setup clears stall
-        ep_tx_ctrl_set(0, USBFS_EP_T_RES_NAK);
         data.ep0_tog  = true;
+        ep_tx_ctrl_set(0, USBFS_EP_T_RES_NAK | USBFS_EP_T_TOG);
         // A new SETUP supersedes any control transfer still in flight; drop its stale EP0 state so a
         // spurious EP0 IN/OUT can't run update_in()/update_out() against the previous request.
         data.xfer[0][TUSB_DIR_OUT].valid = false;
@@ -394,8 +377,10 @@ void dcd_int_handler(uint8_t rhport) {
 
         uint8_t *ep0_out = ep_out_buf(0);
         const tusb_control_request_t *setup = (const tusb_control_request_t *)ep0_out;
-        // EP0_SETUP_RX_TOG arms the data/status stage at DATA1 on the combined-control IP
-        ep_rx_ctrl_set(0, ((setup->wLength == 0) ? USBFS_EP_R_RES_ACK : USBFS_EP_R_RES_NAK) | EP0_SETUP_RX_TOG);
+        data.ep0_status_dir = (setup->wLength && setup->bmRequestType_bit.direction == TUSB_DIR_IN) ? TUSB_DIR_OUT
+                                                                                                    : TUSB_DIR_IN;
+        // The first transaction of either the data or status stage always uses DATA1.
+        ep_rx_ctrl_set(0, ((setup->wLength == 0) ? USBFS_EP_R_RES_ACK : USBFS_EP_R_RES_NAK) | USBFS_EP_R_TOG);
 
         dcd_event_setup_received(rhport, ep0_out, true);
         break;
@@ -555,6 +540,10 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
   // read-modify-write of the (combined) EP control register, which the ISR also RMWs to flip the
   // manual data toggle; re-enabling before they run lets a transfer IRQ clobber that toggle.
   dcd_int_disable(rhport);
+  // The status stage is opposite the data direction (or IN when there is no data) and always
+  // uses DATA1. A zero-length data packet remains in the data direction and keeps its sequence.
+  if (ep == 0 && total_bytes == 0 && dir == data.ep0_status_dir) { data.ep0_tog = true; }
+
   xfer->valid         = true;
   xfer->buffer        = buffer;
   xfer->len           = total_bytes;
@@ -564,7 +553,11 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     update_in(rhport, ep, true);
   } else {
     uint8_t rx_res = data.isochronous[ep][TUSB_DIR_OUT] ? USBFS_EP_R_RES_NYET : USBFS_EP_R_RES_ACK;
-    ep_rx_set_response(ep, rx_res);
+    if (ep == 0) {
+      ep_rx_ctrl_set(0, rx_res | (data.ep0_tog ? USBFS_EP_R_TOG : 0));
+    } else {
+      ep_rx_set_response(ep, rx_res);
+    }
   }
   dcd_int_enable(rhport);
   return true;
@@ -607,8 +600,14 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
       uint8_t res = data.xfer[ep][TUSB_DIR_OUT].valid
                     ? (data.isochronous[ep][TUSB_DIR_OUT] ? USBFS_EP_R_RES_NYET : USBFS_EP_R_RES_ACK)
                     : USBFS_EP_R_RES_NAK;
+#ifdef CH32_USBFS_EP4_MANUAL_TOG
+      ep_rx_ctrl_set(ep, res);
+#endif
       ep_rx_ctrl_set(ep, EP_R_AUTO_TOG | res);
     } else {
+#ifdef CH32_USBFS_EP4_MANUAL_TOG
+      ep_tx_ctrl_set(ep, USBFS_EP_T_RES_NAK);
+#endif
       ep_tx_ctrl_set(ep, EP_T_AUTO_TOG | USBFS_EP_T_RES_NAK);
     }
   }
