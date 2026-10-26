@@ -35,14 +35,14 @@
 TU_VERIFY_STATIC(CFG_TUH_DWC2_ENDPOINT_MAX <= 255, "currently only use 8-bit for index");
 
 #if TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3)
-// The FS core cannot follow a low-speed transaction with another one in the frame it ended in: a low-speed
-// device behind a full-speed hub is addressed with a preamble packet, and a new transfer stage started in that
-// frame (seen right after an IN data stage) makes the core clear HPRT.PENA, which kills the whole root port.
-// ESP-IDF works around this in hcd_dwc.c with a 1 ms delay per low-speed control stage (espressif/esp-idf#15683).
-// Here one preamble channel owns the bus at a time, and the next may start only in a frame after the one its
-// predecessor halted in. That holds in DMA mode too, where the core retries NAKed tokens and runs the packets of
-// a transfer by itself, and it covers the periodic IN of a second low-speed device.
-// Directly attached low-speed devices use no preamble and are not affected.
+// On ESP32-S2/S3 a low-speed device behind a full-speed hub can hang the host's transmitter: it sends the preamble
+// packet but never the low-speed packet after it, and drops the port on the timeout. ESP-IDF delays each low-speed
+// control stage by 1 ms (espressif/esp-idf#15683). On ESP32-S3 the hang only hit the preamble of a transaction the
+// driver started while the last packet on the bus was a low-speed one, about one in fifty of those whatever the gap.
+// A preamble after an SOF or another full-speed packet, within a transaction, or of the core's own NAK retries and
+// packet sequence never hung. So one preamble channel owns the bus at a time, and the next may start only in a frame
+// after the one its predecessor halted in, which puts an SOF in between. The port-disable recovery remains the
+// backstop. Directly attached low-speed devices use no preamble and are not affected.
 #define DWC2_LS_ONE_XACT_PER_FRAME 1
 #else
 #define DWC2_LS_ONE_XACT_PER_FRAME 0
@@ -222,7 +222,6 @@ TU_ATTR_ALWAYS_INLINE static inline uint8_t req_queue_avail(const dwc2_regs_t* d
 
 static uint32_t _ls_frame_end = 0; // last frame used by a low-speed transaction
 static uint8_t _ls_busy_ch = TUSB_INDEX_INVALID_8; // preamble channel in flight: claimed, not yet halted
-static uint8_t _ls_last_ch = TUSB_INDEX_INVALID_8; // preamble channel that held the bus last
 
 TU_ATTR_ALWAYS_INLINE static inline uint32_t ls_frame_now(const dwc2_regs_t* dwc2) {
   return dwc2->hfnum & DWC2_LS_FRAME_MASK;
@@ -267,16 +266,6 @@ static bool ls_frame_claim(const dwc2_regs_t* dwc2, dwc2_channel_t* channel) {
     return false;
   }
 
-  // Take turns: the channel that had the bus last waits while another one is parked. Otherwise a channel re-armed
-  // from its own halt, such as a NAKing bInterval=1 IN or a control stage retried on NAK, would keep the bus for good.
-  if (ch_id == _ls_last_ch) {
-    for (uint8_t i = 0; i < DWC2_CHANNEL_COUNT_MAX; i++) {
-      if (i != ch_id && _hcd_data.xfer[i].allocated && _hcd_data.xfer[i].ls_defer != LS_DEFER_NONE) {
-        return false;
-      }
-    }
-  }
-
   const uint32_t offset = channel_is_periodic(channel->hcchar) ? 1u : 0u;
   if (!ls_frame_free(dwc2, offset)) {
     return false;
@@ -290,7 +279,6 @@ static bool ls_frame_claim(const dwc2_regs_t* dwc2, dwc2_channel_t* channel) {
 TU_ATTR_ALWAYS_INLINE static inline void ls_bus_release(const dwc2_regs_t* dwc2, uint8_t ch_id) {
   if (_ls_busy_ch == ch_id) {
     _ls_busy_ch = TUSB_INDEX_INVALID_8;
-    _ls_last_ch = ch_id;
     const uint32_t now = ls_frame_now(dwc2);
     if (ls_frame_diff(now, _ls_frame_end) > 0) {
       _ls_frame_end = now;
@@ -314,22 +302,24 @@ TU_ATTR_ALWAYS_INLINE static inline void channel_dealloc(dwc2_regs_t* dwc2, uint
   xfer->allocated = false;
 #if DWC2_LS_ONE_XACT_PER_FRAME
   xfer->ls_defer = LS_DEFER_NONE;
+  ls_bus_release(dwc2, ch_id); // a completed periodic IN can retire without a halt interrupt of its own
 #endif
   dwc2->haintmsk &= ~TU_BIT(ch_id);
 }
 
 #if DWC2_LS_ONE_XACT_PER_FRAME
-// Take back a channel parked on a busy low-speed frame. It is programmed but was never enabled, so nothing of it
-// is on the bus and no halt will come to retire it: in DMA mode channel_disable() leaves a periodic channel to an
-// automatic halt that only an enabled channel produces. Returns false when the channel is not parked. The caller
-// masks this controller's interrupt so SOF cannot replay the channel meanwhile.
+// Take back a channel parked on a busy low-speed frame before it was ever enabled: nothing of it is on the bus and
+// no halt will come to retire it, since in DMA mode channel_disable() leaves a periodic channel to an automatic halt
+// that only an enabled channel produces. Returns false otherwise, including for a slave IN parked between the packets
+// of its transfer, which is still enabled and goes through channel_disable() and its halt instead. The caller masks
+// this controller's interrupt so SOF cannot replay the channel meanwhile.
 static bool ls_park_retire(dwc2_regs_t* dwc2, uint8_t ch_id) {
   const hcd_xfer_t* xfer = &_hcd_data.xfer[ch_id];
-  if (!xfer->allocated || xfer->ls_defer == LS_DEFER_NONE) {
+  const dwc2_channel_t* channel = &dwc2->channel[ch_id];
+  if (!xfer->allocated || xfer->ls_defer == LS_DEFER_NONE || (channel->hcchar & HCCHAR_CHENA)) {
     return false;
   }
   // channel_xfer_start() predicts the PID after the whole transfer, give back the one it was armed with
-  const dwc2_channel_t* channel = &dwc2->channel[ch_id];
   const dwc2_channel_char_t hcchar = {.value = channel->hcchar};
   if (hcchar.ep_type != HCCHAR_EPTYPE_ISOCHRONOUS) {
     const dwc2_channel_tsize_t hctsiz = {.value = channel->hctsiz};
@@ -385,7 +375,6 @@ static void channel_cleanup_on_disconnect(dwc2_regs_t *dwc2) {
     _hcd_data.xfer[ch_id].ls_defer = LS_DEFER_NONE;
   }
   _ls_busy_ch = TUSB_INDEX_INVALID_8;
-  _ls_last_ch = TUSB_INDEX_INVALID_8;
   _ls_frame_end = (ls_frame_now(dwc2) - 1u) & DWC2_LS_FRAME_MASK;
 #endif
 
@@ -1936,13 +1925,18 @@ static bool handle_sof_irq(uint8_t rhport, bool in_isr) {
     }
     hcd_endpoint_t* edpt = &_hcd_data.edpt[xfer->ep_id];
     if (xfer->closing || edpt->closing || edpt->aborting) {
-      // Teardown is under way. The channel never reached the bus, so no halt will come to finish it here.
+      // Teardown is under way. A channel that never reached the bus gets no halt to finish it, so retire it here; one
+      // parked between the packets of its transfer is still enabled and finishes through its halt.
       const bool closing = xfer->closing || edpt->closing;
-      ls_park_retire(dwc2, ch_id);
-      if (closing) {
-        edpt_dealloc(edpt);
+      if (ls_park_retire(dwc2, ch_id)) {
+        if (closing) {
+          edpt_dealloc(edpt);
+        } else {
+          edpt->aborting = 0;
+        }
       } else {
-        edpt->aborting = 0;
+        xfer->closing = closing ? 1u : 0u;
+        channel_disable(dwc2, &dwc2->channel[ch_id]);
       }
       continue;
     }
