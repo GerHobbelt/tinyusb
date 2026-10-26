@@ -1,4 +1,4 @@
-﻿include_guard()
+include_guard()
 
 set(APM32_FAMILY apm32f10x)
 set(APM32_SDK ${TOP}/hw/mcu/geehy/APM32F10x_SDK/Libraries)
@@ -10,8 +10,6 @@ include(${CMAKE_CURRENT_LIST_DIR}/boards/${BOARD}/board.cmake)
 set(CMAKE_SYSTEM_CPU cortex-m3 CACHE INTERNAL "System Processor")
 set(CMAKE_TOOLCHAIN_FILE ${TOP}/examples/build_system/cmake/toolchain/arm_${TOOLCHAIN}.cmake)
 
-# set(FAMILY_MCUS APM32F103 APM32F107 CACHE INTERNAL "")
-
 #------------------------------------
 # Startup & Linker script
 #------------------------------------
@@ -20,7 +18,7 @@ set(CMAKE_TOOLCHAIN_FILE ${TOP}/examples/build_system/cmake/toolchain/arm_${TOOL
 set(STARTUP_FILE_GNU ${APM32_SDK}/Device/Geehy/APM32F10x/Source/gcc/startup_${MCU_VARIANT}.S)
 set(STARTUP_FILE_Clang ${STARTUP_FILE_GNU})
 if (NOT DEFINED LD_FILE_GNU)
-set(LD_FILE_GNU ${APM32_SDK}/Device/Geehy/APM32F10x/Source/gcc/${MCU_LINKER_NAME}_flash.ld)
+  set(LD_FILE_GNU ${APM32_SDK}/Device/Geehy/APM32F10x/Source/gcc/${MCU_LINKER_NAME}_flash.ld)
 endif ()
 set(LD_FILE_Clang ${LD_FILE_GNU})
 
@@ -93,11 +91,11 @@ function(family_configure_example TARGET RTOS)
       "LINKER:--script=${LD_FILE_Clang}"
       )
   endif ()
-  
+
   if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
     set_source_files_properties(${CMAKE_CURRENT_FUNCTION_LIST_DIR}/family.c PROPERTIES COMPILE_FLAGS "-Wno-missing-prototypes")
   endif ()
-  
+
   set_source_files_properties(${STARTUP_FILE_${CMAKE_C_COMPILER_ID}} PROPERTIES
     SKIP_LINTING ON
     COMPILE_OPTIONS -w)

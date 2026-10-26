@@ -1,4 +1,4 @@
-﻿/*
+/*
  * The MIT License (MIT)
  *
  * Copyright (c) 2019 Ha Thach (tinyusb.org)
@@ -77,7 +77,9 @@ void board_init(void) {
   RCM_EnableAPB1PeriphClock(RCM_APB1_PERIPH_USB);
 #elif CFG_TUSB_MCU == OPT_MCU_APM32F107
   RCM_EnableAHBPeriphClock(RCM_AHB_PERIPH_OTG_FS);
-  
+
+  // PA11 = DM, PA12 = DP
+  RCM_EnableAPB2PeriphClock(RCM_APB2_PERIPH_GPIOA);
   GPIO_Config_T otg_gpio_config;
   GPIO_ConfigStructInit(&otg_gpio_config);
   otg_gpio_config.pin = GPIO_PIN_11 | GPIO_PIN_12;
@@ -123,7 +125,7 @@ void board_init(void) {
   // UART (USART1: PA9 = TX, PA10 = RX)
   //--------------------------------------------------------------------+
   UART_GPIO_CLK_EN();
-  RCM_EnableAPB2PeriphClock(RCM_APB2_PERIPH_USART1);
+  UART_CLK_EN();
 
   // PA9 = TX (AF push-pull)
   GPIO_Config_T uart_tx_config;
@@ -150,8 +152,8 @@ void board_init(void) {
   usart_config.parity = USART_PARITY_NONE;
   usart_config.mode = USART_MODE_TX_RX;
   usart_config.hardwareFlow = USART_HARDWARE_FLOW_NONE;
-  USART_Config(USART1, &usart_config);
-  USART_Enable(USART1);
+  USART_Config(UART_DEV, &usart_config);
+  USART_Enable(UART_DEV);
 
   board_led_write(false);
 }
@@ -160,36 +162,32 @@ void board_init(void) {
 // Board porting API
 //--------------------------------------------------------------------+
 void board_led_write(bool state) {
-  if (state) {
-    LED_PORT->BC = LED_PIN;  // LED On (active low)
+  if (state == LED_STATE_ON) {
+    LED_PORT->BSC = LED_PIN;
   } else {
-    LED_PORT->BSC = LED_PIN; // LED Off
+    LED_PORT->BC = LED_PIN;
   }
 }
 
 uint32_t board_button_read(void) {
-  // Button is active low (pull-up), return 1 when pressed
-  return (GPIO_ReadInputBit(BUTTON_PORT, BUTTON_PIN) == 0) ? 1 : 0;
+  return (GPIO_ReadInputBit(BUTTON_PORT, BUTTON_PIN) == BUTTON_STATE_ACTIVE) ? 1 : 0;
 }
 
 size_t board_get_unique_id(uint8_t id[], size_t max_len) {
-  (void) max_len;
-  volatile uint32_t *apm32_uuid = ((volatile uint32_t *) 0x1FFFF7E8);
-  uint32_t *id32 = (uint32_t *) (uintptr_t) id;
-  uint8_t const len = 12;
-
-  id32[0] = apm32_uuid[0];
-  id32[1] = apm32_uuid[1];
-  id32[2] = apm32_uuid[2];
-
+  uint32_t const *uuid = (uint32_t const *)0x1FFFF7E8;
+  size_t len = 12;
+  if (len > max_len) {
+    len = max_len;
+  }
+  memcpy(id, uuid, len);
   return len;
 }
 
 int board_uart_read(uint8_t *buf, int len) {
   int count = 0;
   while (count < len) {
-    if (USART_ReadStatusFlag(USART1, USART_FLAG_RXBNE)) {
-      buf[count++] = (uint8_t) USART_RxData(USART1);
+    if (USART_ReadStatusFlag(UART_DEV, USART_FLAG_RXBNE)) {
+      buf[count++] = (uint8_t) USART_RxData(UART_DEV);
     } else {
       break;
     }
@@ -201,8 +199,8 @@ int board_uart_write(void const *buf, int len) {
   const uint8_t *p = (const uint8_t *) buf;
   int count = 0;
   while (count < len) {
-    if (USART_ReadStatusFlag(USART1, USART_FLAG_TXBE)) {
-      USART_TxData(USART1, p[count++]);
+    if (USART_ReadStatusFlag(UART_DEV, USART_FLAG_TXBE)) {
+      USART_TxData(UART_DEV, p[count++]);
     }
   }
   return count;
